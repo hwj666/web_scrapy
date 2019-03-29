@@ -2,13 +2,13 @@ var superagent = require('superagent')
 var charset = require('superagent-charset')
 var request = charset(superagent)
 var cheerio = require('cheerio')
+var fs = require('fs')
 
 var getcodes = (callback) => {
     request.get('http://fund.eastmoney.com/allfund.html')
         .charset('gbk')
         .buffer(true)
         .end((err, res) => {
-            var codes = []
             var $ = cheerio.load(res.text, {
                 ignoreWhitespace: true,
                 xmlMode: true
@@ -17,23 +17,24 @@ var getcodes = (callback) => {
                 var codeinfo = $(elem).find('a').eq(0).text()
                 code = codeinfo.slice(1, 7)
                 info = codeinfo.slice(8)
-                codes.push({ 'code': code, 'info': info })
+                callback(code)
             })
-            callback(codes)
+
         })
 }
-// getcodes((codes) => { 
-//     for (var code of codes){
-//         console.log(code)
-//     }
-//  })
+
+// getcodes((code) => {
+//     fs.appendFileSync('./codes.txt', code, function (err) {
+//         if (err) console.log('写文件操作失败');
+//         else console.log('写文件操作成功');
+//     });
+// })
 var getfunds = (code, page, callback) => {
     request.get('http://fund.eastmoney.com/f10/F10DataApi.aspx')
         .charset('utf8')
         .buffer(true)
         .query({ 'type': 'lsjz', 'code': code, 'page': page, 'per': '20' })
         .end((err, res) => {
-            var funds = []
             var $ = cheerio.load(res.text, {
                 ignoreWhitespace: true,
                 xmlMode: true
@@ -43,14 +44,13 @@ var getfunds = (code, page, callback) => {
                 var v1 = $(elem).find('td').eq(1).text()
                 var v2 = $(elem).find('td').eq(2).text()
                 var r = $(elem).find('td').eq(3).text()
-                funds.push({ 'd': d, 'v1': v1, 'v2': v2, 'r': r })
+                if (v1.trim() !== "" && r.trim() !== "") {
+                    callback(code, d + " " + v1 + " " + v2 + " " + r + "\n")
+                }
             })
-            callback(code, funds)
         })
 }
 
-
-// getfunds('502023','1',(code,funds)=>{console.log(funds)})
 
 var getpages = (code, callback) => {
     request.get('http://fund.eastmoney.com/f10/F10DataApi.aspx')
@@ -63,30 +63,26 @@ var getpages = (code, callback) => {
             callback(code, pages)
         })
 }
-// getpages('502023',(code,pages)=>{
-//     console.log(code, pages);
-// })
 
-var getalldata = (callback) => {
-    getpages('502023', (code, pages) => {
-        var alldata = []
+var getalldata = (fundcode, callback) => {
+    getpages(fundcode, (code, pages) => {
         for (var i = 1; i <= pages; i++) {
             getfunds(code, i.toString(), (code, funds) => {
-                alldata.push(funds)
-                console.log(funds)
+                callback(funds)
             })
         }
-        callback(alldata)
+    })
+}
+var codes = ['000011', '000013', '000014', '000015']
+
+
+for (var code of codes) {
+    console.log(code)
+    getalldata(code, (funds) => {
+        fs.appendFileSync(code + ".txt", funds, function (err) {
+            if (err) console.log('写文件操作失败');
+            else console.log('写文件操作成功');
+        });
     })
 }
 
-getalldata((data)=>{console.log(data)})
-
-// getcodes((codes) => {
-//     for (var codeinfo of codes) {
-//         var code = codeinfo['code']
-//         getpages(code, (code, pages) => {
-//             console.log(code, pages);
-//         })
-//     }
-// })
