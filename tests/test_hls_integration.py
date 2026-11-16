@@ -78,6 +78,10 @@ class EncryptedHlsTests(unittest.TestCase):
                 self.assertGreater(mb, 0)
                 self.assertTrue(os.path.exists(mp4))
                 self.assertGreater(os.path.getsize(mp4), 0)
+                # 原子落盘：成功后不应留下 .mp4.tmp / .tmp.ts 中间文件
+                self.assertFalse(os.path.exists(mp4 + ".tmp"))
+                self.assertEqual(
+                    [n for n in os.listdir(outdir) if n.endswith(".tmp.ts")], [])
                 # 加密没解对时 ffmpeg 合成通常会失败或产出 0 字节；成功即说明
                 # 「按媒体序列号派生 IV」与逐片解密链路是对的。
             finally:

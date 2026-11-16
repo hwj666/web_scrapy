@@ -170,7 +170,7 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
             "card_sel": json.dumps(b.card_title_selector),
         }
         await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-        els = []
+        els: list[dict] = []
         for _ in range(10):
             try:
                 els = await page.evaluate(js) or []

@@ -8,6 +8,8 @@ import unittest
 from contextlib import asynccontextmanager
 from unittest.mock import patch
 
+import httpx
+
 from app.core.exceptions import DomainChanged, NewDomainError
 from app.core.models import JobConfig, ListPage, VideoItem
 from app.core.parsing import ParserContext
@@ -18,9 +20,20 @@ from app.services.domain import DomainProbe
 from app.services.hls import HlsDownloader
 from app.services.job_state import JobState
 from app.services.list_runner import ListRunner
+from app.services.list_url import (
+    candidate_templates,
+    category_id,
+    templates_from_homepage,
+    templates_from_url,
+)
 from app.services.video_worker import VideoWorker
-from app.toolkit.domain_notice import clean_host, find_new_host, page_notice_host, replace_host
-from app.toolkit.http import FetchedResponse, _tls_verify_default
+from app.toolkit.domain_notice import (
+    clean_host,
+    find_new_host,
+    page_notice_target,
+    replace_host,
+)
+from app.toolkit.http import FetchedResponse, _tls_verify_default, should_retry_with_browser
 
 
 def _cfg(tmp: str, **kw) -> JobConfig:
@@ -105,8 +118,12 @@ class _FakeDomain:
     def set_base(self, list_url: str) -> None:
         pass
 
-    async def reprobe(self, why: str = "") -> bool:
+    async def reprobe(self, why: str = "", force: bool = False) -> bool:
         return False
+
+    async def ensure_list_url(self, tpl: str, p1: int = 1,
+                              strict: bool = False) -> str:
+        return tpl
 
 
 class _EmptyStaticList:
@@ -154,6 +171,136 @@ class ListRunnerFallbackTests(unittest.TestCase):
             self.assertEqual([n for n, _ in dispatched], [1])
 
 
+class BrowserTitleFallbackTests(unittest.TestCase):
+    def test_untitled_static_items_use_browser_titles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp, p2=1)
+            state = JobState(cfg)
+            rules = RuleManager()
+            rules.browser.use_api_capture = False
+            html = ("<html><body>"
+                    "<a href='/play/1.html'></a>"
+                    "<a href='/play/2.html'></a>"
+                    "</body></html>")
+
+            async def fetch(url: str, **kw):
+                return html
+
+            class _Page:
+                async def goto(self, *a, **k):
+                    return None
+
+                async def wait_for_timeout(self, *a, **k):
+                    return None
+
+                async def content(self):
+                    return html
+
+            @asynccontextmanager
+            async def new_page():
+                yield _Page(), []
+
+            class _BrowserList:
+                async def parse_with_page(self, page, url, p):
+                    return ListPage(page=p, items=[
+                        VideoItem(id="https://e.com/play/1.html", title="标题一",
+                                  page=p),
+                        VideoItem(id="https://e.com/play/2.html", title="标题二",
+                                  page=p),
+                    ])
+
+            runner = ListRunner(
+                cfg, rules, state, fetch=fetch,
+                static_list=StaticListParser(),
+                browser_list=_BrowserList(),
+                new_page=new_page, domain=_FakeDomain(),  # type: ignore[arg-type]
+                log=lambda msg: None, is_stopped=lambda: False,
+                dispatch=lambda n, item: None)
+            asyncio.run(runner.run())
+
+            self.assertEqual([it.title for it in state.items], ["标题一", "标题二"])
+
+
+class BrowserRetryPolicyTests(unittest.TestCase):
+    def test_404_does_not_trigger_browser(self) -> None:
+        req = httpx.Request("GET", "https://x.com/list")
+        err = httpx.HTTPStatusError("404", request=req,
+                                    response=httpx.Response(404, request=req))
+        self.assertFalse(should_retry_with_browser(err))
+
+    def test_403_triggers_browser(self) -> None:
+        req = httpx.Request("GET", "https://x.com/list")
+        err = httpx.HTTPStatusError("403", request=req,
+                                    response=httpx.Response(403, request=req))
+        self.assertTrue(should_retry_with_browser(err))
+
+    def test_strict_repair_raises_instead_of_continuing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+
+            async def get_raw(url: str):
+                return FetchedResponse(url=url, status=404, headers={},
+                                       content=b"nf")
+
+            probe = DomainProbe(
+                cfg, RuleManager(), get_raw=get_raw, new_page=lambda: None,
+                log=lambda msg: None, ua="test")
+            with self.assertRaises(RuntimeError) as ctx:
+                asyncio.run(probe.ensure_list_url(
+                    "https://new.com/vodtype/144-{}.html", 1, strict=True))
+            self.assertIn("无法自动修复", str(ctx.exception))
+
+
+class BrowserListFetchFallbackTests(unittest.TestCase):
+    def test_http_failure_falls_back_to_browser_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp, p2=1)
+            state = JobState(cfg)
+            rules = RuleManager()
+            rules.browser.use_api_capture = False
+            dispatched: list[int] = []
+            html = ("<html><body>"
+                    "<a href='/play/1.html'>测试视频一</a>"
+                    "</body></html>")
+
+            async def failing_fetch(url: str, **kw):
+                # 模拟被 WAF 挡住的 403：这类错误才值得换浏览器
+                req = httpx.Request("GET", url)
+                resp = httpx.Response(403, request=req)
+                raise httpx.HTTPStatusError("403 Forbidden", request=req,
+                                            response=resp)
+
+            class _Page:
+                async def goto(self, *a, **k):
+                    return None
+
+                async def wait_for_timeout(self, *a, **k):
+                    return None
+
+                async def content(self):
+                    return html
+
+            @asynccontextmanager
+            async def new_page():
+                yield _Page(), []
+
+            class _BrowserList:
+                async def parse_with_page(self, page, url, p):
+                    return ListPage(page=p, items=[])
+
+            runner = ListRunner(
+                cfg, rules, state, fetch=failing_fetch,
+                static_list=StaticListParser(),
+                browser_list=_BrowserList(),
+                new_page=new_page, domain=_FakeDomain(),  # type: ignore[arg-type]
+                log=lambda msg: None, is_stopped=lambda: False,
+                dispatch=lambda n, item: dispatched.append(n))
+            asyncio.run(runner.run())
+
+            self.assertEqual([it.title for it in state.items], ["测试视频一"])
+            self.assertEqual(dispatched, [1])
+
+
 class HlsHelperTests(unittest.TestCase):
     def test_ts_detection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +313,34 @@ class HlsHelperTests(unittest.TestCase):
             self.assertTrue(HlsDownloader._looks_like_ts(good))
             self.assertFalse(HlsDownloader._looks_like_ts(bad))
             self.assertFalse(HlsDownloader._looks_like_ts(os.path.join(tmp, "none")))
+
+    def test_byterange_playlist_is_rejected_before_any_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = JobState(_cfg(tmp))
+            playlist = ("#EXTM3U\n#EXTINF:4,\n#EXT-X-BYTERANGE:100@0\n"
+                        "a.ts\n")
+            requested: list[str] = []
+
+            async def fetch(url: str, **kw):
+                return playlist
+
+            async def fetch_media(url: str, query: str, **kw):
+                requested.append(url)
+                return b""
+
+            hls = HlsDownloader(
+                tmp, 2, state=state, fetch=fetch, fetch_media=fetch_media,
+                log=lambda msg: None, is_stopped=lambda: False,
+                abort_msg=lambda: "")
+            with patch("app.services.hls.ffmpeg_exe", lambda: "ffmpeg"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    asyncio.run(hls.download(
+                        "https://example.com/index.m3u8", "v",
+                        os.path.join(tmp, "v.mp4")))
+            self.assertIn("EXT-X-BYTERANGE", str(ctx.exception))
+            self.assertEqual(requested, [])
+            self.assertFalse(os.path.exists(os.path.join(tmp, "v.mp4")))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "v.mp4.tmp")))
 
     def test_consecutive_segment_failures_trigger_domain_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,6 +436,144 @@ class TlsDefaultTests(unittest.TestCase):
             self.assertTrue(_tls_verify_default())
 
 
+class ListUrlRepairTests(unittest.TestCase):
+    def test_category_id_and_templates_from_concrete_url(self) -> None:
+        self.assertEqual(category_id("https://a.com/vodtype/144-{}.html"), "144")
+        self.assertEqual(category_id("https://a.com/vodtype/{}.html"), "")
+        cands = templates_from_url("https://new.com/vodtype/144-1.html", "144")
+        self.assertIn("https://new.com/vodtype/144-{}.html", cands)
+
+    def test_category_only_url_is_not_turned_into_page_template(self) -> None:
+        cands = templates_from_url("https://new.com/vodtype/144.html", "144")
+        self.assertNotIn("https://new.com/vodtype/{}.html", cands)
+        self.assertIn("https://new.com/vodtype/144.html?page={}", cands)
+
+    def test_candidate_templates_are_absolute(self) -> None:
+        cands = candidate_templates(
+            "https://new.com/vodtype/144-{}.html",
+            ("/vodtype/{cat}-{page}.html", "/vodshow/{cat}--------{page}---.html"))
+        self.assertEqual(cands[0], "https://new.com/vodtype/144-{}.html")
+        self.assertEqual(cands[1],
+                         "https://new.com/vodshow/144--------{}---.html")
+
+
+class HomepageDiscoveryTests(unittest.TestCase):
+    def test_homepage_links_derive_templates(self) -> None:
+        html = ("<a href='/vodtype/144.html'>分类144</a>"
+                "<a href='/vodtype/145.html'>分类145</a>"
+                "<a href='/voddetail/999.html'>详情</a>")
+        found = templates_from_homepage(html, "https://new.com/vodtype/144-{}.html",
+                                        "144")
+        self.assertTrue(any("144" in t for t in found))
+        self.assertFalse(any("/voddetail/" in t for t in found))
+
+    def test_homepage_route_prefix_with_changed_category_id(self) -> None:
+        html = "<a href='/vodshow/777.html'>新分类</a>"
+        found = templates_from_homepage(html, "https://new.com/vodtype/144-{}.html",
+                                        "144")
+        self.assertTrue(any("vodshow/144" in t for t in found))
+
+    def test_directory_listing_is_not_accepted_as_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            listing = (b"<html><body><a href='1.html'>1.html</a>"
+                       b"</body></html>")
+
+            async def get_raw(url: str):
+                if url.endswith("/") or "?page=" in url:
+                    return FetchedResponse(url=url, status=200, headers={},
+                                           content=listing)
+                return FetchedResponse(url=url, status=404, headers={},
+                                       content=b"nf")
+
+            probe = DomainProbe(
+                cfg, RuleManager(), get_raw=get_raw, new_page=lambda: None,
+                log=lambda msg: None, ua="test")
+            tpl = "https://new.com/vodtype/144-{}.html"
+            self.assertEqual(asyncio.run(probe.ensure_list_url(tpl, 1)), tpl)
+
+
+class NoticeChainTests(unittest.TestCase):
+    def test_redirect_then_notice_then_real_site(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            list_html = ("<html><body>"
+                         + "".join(f"<a href='/play/{i}.html'>v{i}</a>"
+                                   for i in range(1, 8))
+                         + "</body></html>").encode()
+
+            def resp(url, status, content=b"", final=None):
+                return FetchedResponse(url=final or url, status=status,
+                                       headers={}, content=content)
+
+            async def get_raw(url: str):
+                if url.rstrip("/") == "https://qing9wa.com":
+                    # 第一跳：旧域名 302 到说明页
+                    return resp(url, 200, b"redirect",
+                                final="https://notice.example.net/")
+                if url.rstrip("/") == "https://notice.example.net":
+                    body = ("<html><body>本站新地址："
+                            "https://real-cinema.com/vodtype/144.html"
+                            "</body></html>").encode()
+                    return resp(url, 200, body)
+                if "/vodtype/144" in url and "real-cinema.com" in url:
+                    return resp(url, 200, list_html)
+                return resp(url, 404, b"nf")
+
+            probe = DomainProbe(
+                cfg, RuleManager(), get_raw=get_raw, new_page=lambda: None,
+                log=lambda msg: None, ua="test")
+            got = asyncio.run(probe.ensure_list_url(
+                "https://qing9wa.com/vodtype/144-{}.html", 1))
+            self.assertEqual(got, "https://real-cinema.com/vodtype/144.html?page={}")
+            self.assertEqual(cfg.base, "https://real-cinema.com")
+
+
+class ListUrlEnsureTests(unittest.TestCase):
+    def test_404_old_path_is_repaired_from_notice_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            list_html = ("<html><body>"
+                         + "".join(f"<a href='/play/{i}.html'>v{i}</a>"
+                                   for i in range(1, 8))
+                         + "</body></html>").encode()
+
+            async def get_raw(url: str):
+                if "/vodtype/144-1.html" in url:
+                    return FetchedResponse(url=url, status=404, headers={},
+                                           content=b"not found")
+                if "/vodshow/144" in url:
+                    return FetchedResponse(url=url, status=200, headers={},
+                                           content=list_html)
+                return FetchedResponse(url=url, status=404, headers={}, content=b"")
+
+            probe = DomainProbe(
+                cfg, RuleManager(), get_raw=get_raw, new_page=lambda: None,
+                log=lambda msg: None, ua="test")
+            probe._notice_url = "https://new.com/vodshow/144--------1---.html"
+            got = asyncio.run(probe.ensure_list_url(
+                "https://new.com/vodtype/144-{}.html", 1))
+            self.assertEqual(got, "https://new.com/vodshow/144--------{}---.html")
+
+    def test_working_list_is_left_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = _cfg(tmp)
+            list_html = ("<html><body>"
+                         + "".join(f"<a href='/play/{i}.html'>v{i}</a>"
+                                   for i in range(1, 8))
+                         + "</body></html>").encode()
+
+            async def get_raw(url: str):
+                return FetchedResponse(url=url, status=200, headers={},
+                                       content=list_html)
+
+            probe = DomainProbe(
+                cfg, RuleManager(), get_raw=get_raw, new_page=lambda: None,
+                log=lambda msg: None, ua="test")
+            tpl = "https://new.com/vodtype/144-{}.html"
+            self.assertEqual(asyncio.run(probe.ensure_list_url(tpl, 1)), tpl)
+
+
 class DomainProbeTests(unittest.TestCase):
     def test_redirect_adoption_and_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -344,10 +657,10 @@ class DomainNoticeTests(unittest.TestCase):
             url_page = _FakeNoticePage(
                 "https://new-site.com/x", "发布页", "点击进入")
             return (
-                await page_notice_host(text_page, rules.pipeline.new_domain_re,
-                                       rules.pipeline.shell_hints, {"old.com"}),
-                await page_notice_host(url_page, rules.pipeline.new_domain_re,
-                                       rules.pipeline.shell_hints, {"old.com"}),
+                (await page_notice_target(text_page, rules.pipeline.new_domain_re,
+                                          rules.pipeline.shell_hints, {"old.com"}))[0],
+                (await page_notice_target(url_page, rules.pipeline.new_domain_re,
+                                          rules.pipeline.shell_hints, {"old.com"}))[0],
             )
 
         self.assertEqual(asyncio.run(run()), ("new-site.com", "new-site.com"))

@@ -8,7 +8,7 @@ from app.core.exceptions import NewDomainError
 from app.core.models import ResolvedVideo, VideoItem
 from app.core.parsing import ParserContext, Resolver
 from app.core.rules import RuleManager
-from app.toolkit.domain_notice import close_pages, page_notice_host, page_opener_matches
+from app.toolkit.domain_notice import close_pages, page_notice_target, page_opener_matches
 from app.toolkit.title import TitleCleaner
 from app.toolkit.url import abs_url
 
@@ -105,7 +105,7 @@ class BrowserResolver(Resolver):
                 # 弹窗已经加载出“新域名”提示时不用再等满 30 秒
                 if popups and not any(".m3u8" in h for h in hits):
                     for popup in popups:
-                        host = await page_notice_host(
+                        host, _notice_url = await page_notice_target(
                             popup, self.manager.pipeline.new_domain_re,
                             self.manager.pipeline.shell_hints, exclude)
                         if host:
@@ -115,7 +115,7 @@ class BrowserResolver(Resolver):
                                      title=await self._browser_title(page))
 
             # 没拿到 m3u8：检查当前页和弹窗，是否在提示“站点已换新域名”
-            host = await page_notice_host(
+            host, _notice_url = await page_notice_target(
                 page, self.manager.pipeline.new_domain_re,
                 self.manager.pipeline.shell_hints, exclude)
             for popup in popups:
@@ -125,7 +125,7 @@ class BrowserResolver(Resolver):
                     pass
                 if host:
                     continue
-                host = await page_notice_host(
+                host, _notice_url = await page_notice_target(
                     popup, self.manager.pipeline.new_domain_re,
                     self.manager.pipeline.shell_hints, exclude)
             if host:

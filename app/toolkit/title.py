@@ -70,6 +70,7 @@ class TitleCleaner:
 
     def from_title_tag(self, title_tag: str, site_names: Iterable[str] = ()) -> str:
         raw = html_mod.unescape(str(title_tag or ""))
+        site_names = [self.clean(x) for x in site_names if x]
         sep_re = self._cache.get("sep_re")
         cleaned: list[str] = []
         for seg in (sep_re.split(raw) if sep_re else [raw]):

@@ -7,6 +7,8 @@ from app.toolkit.codec import decode_body, decode_page, unpad_pkcs7
 from app.toolkit.m3u8 import (
     abs_segment,
     best_variant,
+    has_byterange,
+    has_endlist,
     has_init_segment,
     key_info,
     key_schedule,
@@ -96,6 +98,13 @@ class M3u8Tests(unittest.TestCase):
             '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\nseg.m4s\n'))
         self.assertFalse(has_init_segment("#EXTM3U\nseg.ts\n"))
 
+    def test_byterange_and_endlist_detection(self) -> None:
+        text = "#EXTM3U\n#EXT-X-BYTERANGE:100@0\n#EXTINF:4,\nseg.ts\n"
+        self.assertTrue(has_byterange(text))
+        self.assertFalse(has_byterange("#EXTM3U\nseg.ts\n"))
+        self.assertTrue(has_endlist("#EXTM3U\n#EXT-X-ENDLIST\n"))
+        self.assertFalse(has_endlist("#EXTM3U\n#EXTINF:4,\nseg.ts\n"))
+
 
 class UrlCodecTests(unittest.TestCase):
     def test_split_urls(self) -> None:
@@ -110,6 +119,20 @@ class UrlCodecTests(unittest.TestCase):
                          "https://x.com/list/9")
         self.assertEqual(auto_list_url("https://x.com/list/", 2),
                          "https://x.com/list?page=2")
+
+    def test_auto_list_url_keeps_query_and_fragment(self) -> None:
+        # 路径里的数字才是页码，query 里的 id/普通参数不能被改
+        self.assertEqual(auto_list_url("https://x.com/list/3.html?x=1", 9),
+                         "https://x.com/list/9.html?x=1")
+        # 已有 page 参数：改值而不是再拼一个
+        self.assertEqual(auto_list_url("https://x.com/list?page=1", 9),
+                         "https://x.com/list?page=9")
+        # 普通 query：追加 page，用 & 连接
+        self.assertEqual(auto_list_url("https://x.com/list?foo=1", 9),
+                         "https://x.com/list?foo=1&page=9")
+        # fragment 必须留在最后
+        self.assertEqual(auto_list_url("https://x.com/list#top", 9),
+                         "https://x.com/list?page=9#top")
 
     def test_abs_url(self) -> None:
         self.assertEqual(abs_url("/a/b", "https://x.com/c/d"), "https://x.com/a/b")

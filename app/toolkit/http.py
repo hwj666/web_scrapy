@@ -37,6 +37,25 @@ class FetchError(RuntimeError):
         super().__init__(f"fetch failed {url}: {cause}")
 
 
+def http_status(e: BaseException) -> int | None:
+    """从异常里取 HTTP 状态码（分不清时返回 None）。"""
+    cause = e.cause if isinstance(e, FetchError) else e
+    return getattr(getattr(cause, "response", None), "status_code", None)
+
+
+# 这些状态码说明「被挡/被限流」，值得换浏览器再试；404/410 是路径不存在，
+# 再开浏览器只是白等 20 多秒。
+_BROWSER_RETRY_STATUS = frozenset({401, 403, 429, 451, 500, 502, 503, 504})
+
+
+def should_retry_with_browser(e: BaseException) -> bool:
+    """HTTP 取页失败后是否值得改用浏览器重试。"""
+    status = http_status(e)
+    if status is not None:
+        return status in _BROWSER_RETRY_STATUS
+    return is_conn_error(e)
+
+
 def is_conn_error(e: BaseException) -> bool:
     """是否属于「连不上」类错误（域名失效/被阻断）。4xx/5xx 不算。
 

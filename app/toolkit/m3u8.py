@@ -8,6 +8,8 @@ _MEDIA_SEQ_RE = re.compile(r"#EXT-X-MEDIA-SEQUENCE:\s*(\d+)", re.I)
 _STREAM_RE = re.compile(r"^#EXT-X-STREAM-INF", re.I)
 _BANDWIDTH_RE = re.compile(r"BANDWIDTH\s*=\s*(\d+)", re.I)
 _INIT_MAP_RE = re.compile(r"^#EXT-X-MAP:", re.I | re.M)
+_BYTERANGE_RE = re.compile(r"^#EXT-X-BYTERANGE:", re.I | re.M)
+_ENDLIST_RE = re.compile(r"^#EXT-X-ENDLIST\s*$", re.I | re.M)
 
 # 一个媒体分片对应的密钥槽位: (key URI, 显式 IV, 显式 IV 十六进制, 媒体序列号)
 KeySlot = tuple[str, bytes | None, str, int]
@@ -20,6 +22,20 @@ def is_master(text: str | None) -> bool:
 def has_init_segment(text: str | None) -> bool:
     """是否 fMP4（#EXT-X-MAP 初始化段）。当前合成链路只支持 TS 分片。"""
     return bool(_INIT_MAP_RE.search(text or ""))
+
+
+def has_byterange(text: str | None) -> bool:
+    """是否使用 #EXT-X-BYTERANGE（同一文件按字节区间切片）。
+
+    当前下载器按「一个 URL 一个完整分片」处理，遇到 BYTERANGE 会把整个文件
+    重复下 N 次，必须在下载前明确拒绝，避免产出花屏/超大坏文件。
+    """
+    return bool(_BYTERANGE_RE.search(text or ""))
+
+
+def has_endlist(text: str | None) -> bool:
+    """媒体列表是否已结束（#EXT-X-ENDLIST）。没有它通常意味着直播/滚动窗口。"""
+    return bool(_ENDLIST_RE.search(text or ""))
 
 
 def media_lines(text: str | None) -> list[str]:

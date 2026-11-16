@@ -38,11 +38,13 @@
 
 - 输出目录 `<outdir>/`（默认 `OUTDIR` 或仓库根 `downloads/`）
   - `NNN_标题.mp4` — 成品
+  - `NNN_标题.mp4.tmp` — ffmpeg 合成中的临时成品；成功后 `os.replace` 原子改名，
+    失败/停止时删除（避免把半截 MP4 误判为已完成）
   - `NNN_标题.tmp.ts` — 解密合并中的中间流；失败时保留为 `.ts` 便于手工转封装
   - `NNN_标题.tmp.ts.parts/` — 分片缓存（断点续传用，成功后删除）
   - `manifest_web.json` — 本次解析出的视频清单
   - `_web_log.txt` — 任务日志（追加写，超过 5MB 自动轮转为 `.1`）
-  - `_failed_web.txt` — 失败清单（可被一键重试复用）
+  - `_failed_web.txt` — 失败清单（供人工排查/导入；「一键重试」用的是内存里的任务状态）
   - `_vdf_results.json` / `_vdf_db/` — 查重结果与 VDF 帧哈希库
 - 日志目录 `<outdir>/_logs/`（可用 `YS_LOG_DIR` 改）
   - `_server_dbg.log` — 未捕获异常
@@ -131,7 +133,7 @@ flowchart TD
 - `link_rules.yaml`：列表页链接的排除词 / 扩展名 / 广告特征 / 播放页提示 / id 特征 / 标题块 class。
 - `pipeline_rules.yaml`：熔断阈值、分片并发、重探冷却、磁盘下限、不可重试关键词、
   发布页提示、跳转信号、m3u8 正则、加密 blob 形态、浏览器触发/标题候选选择器、
-  发布页按钮文字、页面新域名识别正则。
+  发布页按钮文字、页面新域名识别正则、换域名后的列表路径候选模板。
 
 ### 4.2 解析器策略
 
@@ -183,6 +185,22 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
   `publish_click_texts`；同时监听当前页打开的新标签页/弹窗，从新页面 URL 或
   “最新地址/新域名: xxx”文字里识别 host，切换整个任务的 base，并把已入队的旧域名 URL
   重写到新域名后重试当前视频。
+- **列表路径修复**：换域名时只换 host 会保留旧路径，而站点经常连列表路由一起改版。
+  拿到新域名后会先校验列表页，不可用时按可信度依次探测：
+  1. **跟随跳转链**：`旧域名 → 跳转/说明页 → 页面上写的新网址`（最多 3 跳，
+     HTTP 跳转、页面文字“最新网址/新域名: …”、页面链接都认；JS 渲染的说明页会用浏览器再读一次）；
+  2. 发布页/弹窗里给出的新站点链接（优先带原分类 id 的列表页）；
+  3. 新域名首页自己的分类链接与列表路由前缀；
+  4. `list_url_patterns` 常见路由（`/vodtype/{cat}-{page}.html`、
+     `/vodshow/{cat}--------{page}---.html` 等）；
+  5. https/http 互备。
+
+  详情/播放路由不会被误当列表页；命中后替换 `list_url` 并把新模板加入候选，
+  只有第 1 页会省略 `?page=1`（`/vodtype/144.html?page={}` → 第 1 页是 `/vodtype/144.html`）。
+- **快速失败**：列表路径修不好时直接抛错结束任务（日志给出可照抄的候选格式），
+  不再逐页解析、也不再对 404 开浏览器白等；只有 401/403/429/451/5xx 或连不上时才用浏览器重取页面。
+- **HTTP 被挡时退回浏览器**：列表页 HTTP 请求失败（换域名后常见的 403/WAF）时，
+  改用浏览器打开页面取 HTML 再解析，而不是直接当空页。
 - **运行中域名失效**：分片连续失败（或本次下载有分片最终失败）时不等普通视频重试，
   立即强制重探一次域名；切换成功后 `domain.epoch` 递增，所有正在下载的视频会丢弃旧
   m3u8、重新解析播放页（`.parts` 缓存按指纹决定续传或清空）。
@@ -196,15 +214,19 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 控制台页面（`Cache-Control: no-store`） |
+| GET | `/api/health` | 健康检查（给 Docker healthcheck / 反代探活用） |
 | GET | `/api/job` | 任务状态快照；无任务返回 `{"empty": true}` |
-| GET | `/api/events` | 任务状态 SSE（前端优先使用，断开自动退回轮询） |
+| GET | `/api/events` | 任务状态 SSE（状态未变化时不重复推送，15 秒心跳；断开自动退回轮询） |
 | POST | `/api/start` | `{list_url,p1,p2,outdir,workers}` 启动任务 |
 | POST | `/api/stop` | 请求停止当前任务 |
 | POST | `/api/retry_failed` | 重试失败/未完成视频，返回 `count` |
 | GET | `/api/dedup/status` | 查重进度、分组、可用性 |
-| POST | `/api/dedup/start` | `{dir,percent}` 启动扫描 |
+| POST | `/api/dedup/start` | `{dir,percent}` 启动扫描（下载任务运行中会被拒绝） |
 | POST | `/api/dedup/stop` | 停止扫描 |
-| POST | `/api/dedup/apply` | `{strategy,mode}` 执行清理 |
+| POST | `/api/dedup/apply` | `{strategy,mode}` 执行清理（下载任务运行中会被拒绝） |
+
+> 下载与查重互斥：任务运行中不允许扫描/清理，扫描进行中也不允许启动/重试下载，
+> 避免 VDF 读到正在写入的 MP4。
 
 > 接口没有鉴权且默认监听 `0.0.0.0`，只适合本机/内网使用。
 
@@ -235,10 +257,10 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
 本地（需 Python ≥ 3.11 与 ffmpeg）：
 
 ```bash
-uv sync --no-dev
+uv sync                      # 含 dev 依赖（pytest/ruff/mypy）
 uv run uvicorn main:app --host 0.0.0.0 --port 8765 --reload
-# 或
-python main.py
+# 只装运行期依赖（生产）:
+uv sync --no-dev
 ```
 
 容器：
@@ -247,21 +269,23 @@ python main.py
 docker compose up -d --build
 ```
 
-> Dockerfile 会从 `uv.lock` 读取 Playwright 版本再安装对应浏览器，升级 `playwright`
-> 后重新 build 镜像即可，不需要同步修改 Dockerfile。
+> Dockerfile 里安装 Playwright 浏览器的版本是硬编码的，必须与
+> `pyproject.toml` / `uv.lock` 里的 `playwright` 版本保持一致；升级 `playwright`
+> 时要同时改 Dockerfile 那一行，否则镜像里的浏览器与本机驱动版本不匹配。
+> compose 已带 `/api/health` 健康检查和 30 秒停止宽限期。
 
 测试：
 
 ```bash
-python -m unittest discover -s tests -v      # 或
-python -m pytest -q                          # pytest 配置在 pyproject.toml
+uv run python -m unittest discover -s tests -v      # 或
+uv run python -m pytest -q                          # pytest 配置在 pyproject.toml
 ```
 
 - `test_pure.py`：m3u8/密钥计划/URL/编解码纯函数单测（不依赖网络）。
 - `test_job_logic.py`：分片解密合并（含轮换密钥、逐片 IV）、一键重试进度、列表页并发有序性、异步日志。
 - `test_modules.py`：拆分后的 JobState / DomainProbe / VideoWorker / 列表 API 兜底、
   HLS 缓存指纹与 TS 校验、分片失败触发域名恢复、epoch 中断在跑下载、发布页新域名识别
-  与 URL 重写、TLS 默认值边界测试。
+  与 URL 重写、换域名后列表路径修复、TLS 默认值边界测试。
 - `test_domain_popup.py`：用假页面对象验证“播放页弹窗/新标签页提示新域名”的识别。
 - `test_dedup.py`：VDF 结果解析、保留项标记、文件名匹配、扫描视频枚举。
 - `test_hls_integration.py`：现场用 ffmpeg 生成 AES-128 加密 HLS，起本地 HTTP 服务走完整
@@ -271,10 +295,12 @@ python -m pytest -q                          # pytest 配置在 pyproject.toml
 
 ### 代码质量
 
-`pyproject.toml` 里已经配好 `[tool.ruff]` / `[tool.pytest.ini_options]` / `[tool.mypy]`：
+`pyproject.toml` 里已经配好 `[tool.ruff]` / `[tool.pytest.ini_options]` / `[tool.mypy]`，
+并把 pytest/ruff/mypy 放进 `[dependency-groups] dev`（`uv sync` 默认安装）：
 
 ```bash
-uvx ruff check .          # 当前零告警
+uv run ruff check .          # 当前零告警
+uv run mypy                  # 当前零错误
 uv run python -m pytest -q
 ```
 
@@ -314,6 +340,8 @@ uv run python -m pytest -q
 - 大列表全部保留在内存中，前端最多渲染 300 行。
 - 换域名弹窗识别依赖页面出现“新域名/最新地址/发布页”等提示，或弹窗带 `opener`
   可关联到当前页；完全无提示的广告式跳转、`noopener` 弹窗不一定能识别。
+- 列表路径修复只覆盖 `list_url_patterns` 里的常见路由；站点用了很特殊的路径时
+  需要把模板加进 YAML，或手工改任务里的列表链接。
 - 运行中强制重探仍只探测列表 URL / 候选域名；旧域名仍可访问、页面也没有任何换域名提示时，
   程序无法自动发现新站，需要把新域名填进候选链接或重新运行任务。
 - `.tmp.ts.parts/` 分片缓存有密钥/播放列表指纹校验，但不会自动过期；长期运行后仍建议手工清理。

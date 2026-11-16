@@ -584,11 +584,15 @@ tick();
       $("#dupPanel").style.display =
         (scanning || hasResult || j.available === false) ? "" : "none";
       $("#dupWarn").style.display = j.available === false ? "block" : "none";
+      // 下载任务运行中不让扫描/清理：VDF 可能读到正在写入的 MP4，产生假重复
+      const pipeRunning = !!running;
       const sb=$("#dupScan");
-      sb.disabled = !avail;
+      sb.disabled = !avail || (pipeRunning && !scanning);
+      sb.title = (pipeRunning && !scanning) ? "下载任务运行中，任务结束后再扫描" : "";
       if(scanning){sb.textContent="⏹ 停止扫描";sb.className="danger";}
       else{sb.textContent="🔍 扫描重复视频";sb.className="primary";}
-      $("#dupApply").disabled = scanning || D.busy || !(j.groups && j.groups.length);
+      $("#dupApply").disabled = scanning || D.busy || pipeRunning
+        || !(j.groups && j.groups.length);
       $("#dupStat").textContent = scanning ? "扫描中…"
         : j.stage === "done" ? "扫描完成"
         : j.stage === "error" ? "扫描出错" : "";
@@ -665,6 +669,10 @@ tick();
     }
 
     async function startScan(){
+      if(running){
+        toast("下载任务运行中，等任务结束后再扫描", true);
+        return;
+      }
       if(D.st && D.st.available === false){
         toast("未找到 vdf 命令，请先安装 videoduplicatefinder CLI", true);
         return;
@@ -708,6 +716,7 @@ tick();
 
     async function applyCleanup(){
       if(D.busy) return;
+      if(running){ toast("下载任务运行中，等任务结束后再清理", true); return; }
       const strategy = $("#dupStrategy").value;
       const mode = $("#dupMode").value;
       if(!strategy || !mode) return toast("请先选择清理策略和模式", true);

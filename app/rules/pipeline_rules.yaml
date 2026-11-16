@@ -31,9 +31,12 @@ pipeline:
     - "不支持的加密方式"
     - "不支持的密钥格式"
     - "密钥标签缺少 URI"
-    # fMP4(#EXT-X-MAP) 属于链路能力缺口，重试没有意义
+    # fMP4(#EXT-X-MAP) / 字节区间分片属于链路能力缺口，重试没有意义
     - "fMP4"
     - "EXT-X-MAP"
+    - "EXT-X-BYTERANGE"
+    - "找不到可执行的 ffmpeg"
+    - "ffmpeg 不可用"
     - "不是 TS 流"
   # 发布页/换域名提示页上的按钮文字（按顺序尝试，命中即点）
   publish_click_texts:
@@ -45,8 +48,19 @@ pipeline:
   # 从页面文字里识别新域名（正则必须有一个分组是域名）
   # 只在页面本身带发布页/换域名提示时使用，避免把普通文章里的链接误判成新站。
   new_domain_patterns:
-    - "(?:新域名|最新域名|永久域名|最新地址|永久地址|访问地址|备用地址|新地址)[：:\\s]*(?:https?://)?([a-z0-9.-]+\\.[a-z]{2,})"
+    - "(?:新域名|最新域名|永久域名|新网址|最新网址|永久网址|最新地址|永久地址|访问地址|备用地址|新地址)[：:\\s]*(?:https?://)?([a-z0-9.-]+\\.[a-z]{2,})"
     - "(?:请访问|请使用|请收藏|请更换为|更换为|改为)[：:\\s]*(?:https?://)?([a-z0-9.-]+\\.[a-z]{2,})"
+  # 换域名/改版后旧列表路径 404 时，按这些模板探测可用路径。
+  # {cat} = 原模板里的分类 id，{page} = 页码；没有 {page} 的会退回 ?page=N。
+  list_url_patterns:
+    - "/vodtype/{cat}-{page}.html"
+    - "/vodtype/{cat}.html"
+    - "/vodshow/{cat}--------{page}---.html"
+    - "/vodtype/{cat}/page/{page}.html"
+    - "/list/{cat}-{page}.html"
+    - "/type/{cat}-{page}.html"
+    - "/vod/{cat}/page/{page}.html"
+    - "/index.php/vod/type/id/{cat}.html"
   # 页面里出现这些字样，说明拿到的是「发布页/壳站」，才值得启动浏览器找真站入口
   shell_hints:
     - "发布页"

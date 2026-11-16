@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 # 只接受看起来像站点的 host（拒绝 localhost、裸 IP、javascript 等）
@@ -43,6 +44,26 @@ def find_new_host(text: str | None, pattern: re.Pattern[str] | None,
     return None
 
 
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>）)】\u3000]+", re.I)
+
+
+def find_new_url(text: str | None, pattern: re.Pattern[str] | None,
+                 exclude: Iterable[str] = ()) -> tuple[str, str | None]:
+    """识别新域名，并尽量把发布页里给出的完整 URL 一起带回来。
+
+    只换 host 会丢掉路径：站点换域名时常连列表路径一起改版，
+    所以能拿到完整地址时优先用它（返回的 url 可能是列表页地址）。
+    """
+    host = find_new_host(text, pattern, exclude)
+    if not host:
+        return "", None
+    for match in _URL_IN_TEXT_RE.finditer(text or ""):
+        url = match.group(0).rstrip(".,;:，。；：")
+        if clean_host(url) == host:
+            return host, url
+    return host, None
+
+
 def replace_host(url: str, old_hosts: Iterable[str], new_host: str) -> str:
     """保留路径/查询串，只替换 host。"""
     up = urlsplit(url)
@@ -52,10 +73,10 @@ def replace_host(url: str, old_hosts: Iterable[str], new_host: str) -> str:
     return urlunsplit(up._replace(netloc=new_host))
 
 
-async def page_notice_host(page, pattern: re.Pattern[str] | None,
-                           shell_hints: Iterable[str],
-                           exclude: Iterable[str]) -> str | None:
-    """检查一个 Playwright 页面：先看文字里的新域名，再看“发布页”URL。"""
+async def page_notice_target(page, pattern: re.Pattern[str] | None,
+                             shell_hints: Iterable[str],
+                             exclude: Iterable[str]) -> tuple[str, str | None]:
+    """检查一个 Playwright 页面：返回 (新 host, 发布页里给出的完整 URL 或 None)。"""
     try:
         title = await page.title()
     except Exception:
@@ -65,15 +86,15 @@ async def page_notice_host(page, pattern: re.Pattern[str] | None,
     except Exception:
         body = ""
     text = f"{title}\n{body}"[:50000]
-    host = find_new_host(text, pattern, exclude)
+    host, url = find_new_url(text, pattern, exclude)
     if host:
-        return host
+        return host, url
     # 没有明确“新域名: xxx”字样时，只有带发布页提示的页面才用当前 URL 的 host
     if any(k in text for k in shell_hints):
         host = host_from_url(page.url)
         if host and host not in {str(x).lower() for x in exclude if x}:
-            return host
-    return None
+            return host, page.url
+    return "", None
 
 
 def page_opener_matches(page, opener) -> bool:
@@ -84,7 +105,7 @@ def page_opener_matches(page, opener) -> bool:
         return False
 
 
-async def close_pages(pages: Iterable[object]) -> None:
+async def close_pages(pages: Iterable[Any]) -> None:
     for page in pages:
         try:
             await page.close()

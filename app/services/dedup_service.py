@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
 import re
 import shutil
@@ -62,6 +63,26 @@ VIDEO_EXTS = frozenset({
 FILES_MAX = 5000        # 单次扫描枚举文件数上限（避免把整块盘塞进内存）
 FILES_IN_SNAPSHOT = 500  # /api/dedup/status 最多回传多少行
 
+# 本工具自己的中间文件不能参与查重：半截 .tmp.ts / 原子落盘用的 .mp4.tmp /
+# 分片缓存的 .part。否则可能把「写了一半的文件」当成重复项，甚至误删成品。
+_TMP_VIDEO_RE = re.compile(r"(?:\.tmp\.(?:ts|mp4)|\.mp4\.tmp|\.part\d*)$", re.I)
+
+
+def _decode_line(raw: bytes) -> str:
+    """解码 VDF 输出的一行：UTF-8 优先，Windows 下退回系统代码页（通常是 GBK）。
+
+    VDF 是 .NET 程序，stdout 被重定向时可能按 OEM/系统代码页输出；固定用 UTF-8
+    会让中文文件名变成替换符，逐文件进度就匹配不到真正的文件了。
+    """
+    if not raw:
+        return ""
+    for enc in ("utf-8", locale.getpreferredencoding(False) or "gb18030", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", "replace")
+
 
 def _stage_kind(label: str) -> str:
     low = (label or "").lower()
@@ -78,6 +99,8 @@ def _list_videos(root: str) -> list[dict]:
         dirnames[:] = [d for d in dirnames if d not in (DB_DIR, ".tmp.ts.parts")]
         for fn in filenames:
             if os.path.splitext(fn)[1].lower() not in VIDEO_EXTS:
+                continue
+            if _TMP_VIDEO_RE.search(fn):
                 continue
             p = os.path.join(dirpath, fn)
             try:
@@ -205,6 +228,12 @@ class DedupService:
         self._by_base: dict[str, int] = {}
         self._last_file_key = ""
         self._last_cmp_key = ""
+
+    @property
+    def busy(self) -> bool:
+        """扫描进行中（或正在启动），流水线任务应避开这个时间窗。"""
+        with self.lock:
+            return bool(self.st["running"] or self._starting)
 
     def snapshot(self) -> dict:
         avail = bool(_vdf_exe())
@@ -345,7 +374,7 @@ class DedupService:
 
     def _on_scan_line(self, line: str) -> None:
         low = line.lower()
-        if line.startswith("[scan]"):
+        if low.startswith("[scan]"):
             if "hashing complete" in low:
                 self._mark_all_done()
                 with self.lock:
@@ -437,6 +466,7 @@ class DedupService:
             key = key[3:]
         with self.lock:
             files = self.st["files"]
+            idx: int | None
             if key and key == self._last_file_key and self._cur_idx is not None:
                 idx = self._cur_idx
             else:
@@ -465,6 +495,7 @@ class DedupService:
             key = key[3:]
         with self.lock:
             files = self.st["files"]
+            idx: int | None
             if key and key == self._last_cmp_key and self._cur_cmp is not None:
                 idx = self._cur_cmp
             else:
@@ -494,6 +525,9 @@ class DedupService:
                                  stderr=subprocess.STDOUT, bufsize=0, **no_window())
         except OSError as e:
             return False, f"无法启动 vdf: {e}"
+        stdout = p.stdout
+        if stdout is None:
+            return False, "无法读取 vdf 输出"
         with self.lock:
             self.proc = p
         tail: list[str] = []
@@ -503,7 +537,7 @@ class DedupService:
                 if self.ev.is_set():
                     break
                 try:
-                    chunk = p.stdout.read(4096)
+                    chunk = stdout.read(4096)
                 except OSError:
                     break
                 if not chunk:
@@ -512,7 +546,7 @@ class DedupService:
                 parts = re.split(rb"[\r\n]", buf)
                 buf = parts.pop()
                 for raw in parts:
-                    line = raw.decode("utf-8", "replace").strip()
+                    line = _decode_line(raw).strip()
                     if not line:
                         continue
                     tail.append(line)
@@ -548,13 +582,16 @@ class DedupService:
         return True, ""
 
     def _load_groups(self, path: str) -> list[dict]:
+        if not path or not os.path.isfile(path):
+            # vdf 在「没有重复」时可能不写输出文件；这不是解析失败。
+            return []
         with open(path, encoding="utf-8") as f:
             raw = json.load(f) or []
         if isinstance(raw, dict):
             raw = raw.get("groups") or raw.get("Groups") or []
-        groups = []
+        groups: list[dict] = []
         for g in raw:
-            items = []
+            items: list[dict] = []
             for it in (g.get("Items") or []):
                 p = str(it.get("Path") or "")
                 if not p:

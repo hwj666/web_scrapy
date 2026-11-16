@@ -14,7 +14,15 @@ from urllib.parse import urlparse
 from app.core.exceptions import DomainChanged, JobAborted, StopJob
 from app.services.job_state import JobState
 from app.toolkit.files import dbg_log, ffmpeg_exe, log_dir, no_window
-from app.toolkit.m3u8 import abs_segment, has_init_segment, key_schedule, media_lines, resolve_playlist
+from app.toolkit.m3u8 import (
+    abs_segment,
+    has_byterange,
+    has_endlist,
+    has_init_segment,
+    key_schedule,
+    media_lines,
+    resolve_playlist,
+)
 from app.toolkit.segments import concat_segments, save_segment
 
 _DBG_PATH = os.path.join(log_dir(), "_server_dbg.log")
@@ -47,15 +55,40 @@ class HlsDownloader:
         self._recover = recover or _no_recover
         self._ffmpeg_procs: set[subprocess.Popen] = set()
         self._ffmpeg_lock = threading.Lock()
+        self._ffmpeg_ok = False
+        self._ffmpeg_err = ""
+
+    async def _ensure_ffmpeg(self) -> None:
+        """第一次下载前确认 ffmpeg 可用；失败信息缓存，避免每个视频都重试探测。"""
+        if self._ffmpeg_ok:
+            return
+        if self._ffmpeg_err:
+            raise RuntimeError(self._ffmpeg_err)
+        try:
+            await asyncio.to_thread(ffmpeg_exe)
+        except RuntimeError as e:
+            self._ffmpeg_err = str(e) or "找不到可执行的 ffmpeg"
+            raise RuntimeError(self._ffmpeg_err) from e
+        except Exception as e:
+            self._ffmpeg_err = f"ffmpeg 不可用: {type(e).__name__}: {e}"
+            raise RuntimeError(self._ffmpeg_err) from e
+        self._ffmpeg_ok = True
 
     async def download(self, m3u8_url: str, name: str, mp4: str,
                        vi: int | None = None) -> float:
+        await self._ensure_ffmpeg()
         self.state.set_stage("seg", current=name)
         text, final_url = await resolve_playlist(self._fetch, m3u8_url)
         if has_init_segment(text):
             # fMP4 需要先拼接 EXT-X-MAP 初始化段，当前合成链路只支持 TS 分片。
             # 这里提前给出可读错误，避免几百片下载完才在 ffmpeg 阶段报"合成失败"。
             raise RuntimeError("fMP4(EXT-X-MAP) 播放列表暂不支持")
+        if has_byterange(text):
+            # 同一个文件按字节区间切成多片：当前按 URL 逐片下载会把整个文件重复下 N 次。
+            raise RuntimeError("EXT-X-BYTERANGE 播放列表暂不支持")
+        if not has_endlist(text):
+            self.log(f"[{name}] 警告: 播放列表没有 #EXT-X-ENDLIST, "
+                     "可能是直播/滚动窗口, 只能下到当前窗口")
         segs = [abs_segment(s, final_url) for s in media_lines(text)]
         if not segs:
             raise RuntimeError("no segments in m3u8")
@@ -168,9 +201,20 @@ class HlsDownloader:
                 pass
             raise RuntimeError("分片解密后不是 TS 流(密钥/IV 可能不匹配)")
 
+        # 先写 <name>.mp4.tmp，成功后再 os.replace 到目标名：进程被杀/磁盘满时
+        # 不会留下一个「看起来已完成」的半截 MP4，下次任务也不会误判为跳过。
+        tmp_mp4 = mp4 + ".tmp"
+        try:
+            os.remove(tmp_mp4)
+        except OSError:
+            pass
         # 用 to_thread + Popen：ffmpeg 是阻塞子进程，且要能被 shutdown() 杀掉
-        exe, rc, detail = await asyncio.to_thread(self._ffmpeg_run, ts, mp4)
-        if rc != 0 or not os.path.exists(mp4) or os.path.getsize(mp4) == 0:
+        exe, rc, detail = await asyncio.to_thread(self._ffmpeg_run, ts, tmp_mp4)
+        if rc != 0 or not os.path.exists(tmp_mp4) or os.path.getsize(tmp_mp4) == 0:
+            try:
+                os.remove(tmp_mp4)
+            except OSError:
+                pass
             # 被停机/熔断杀掉的 ffmpeg 不是"合成失败"，别写成失败记录
             if self._is_stopped():
                 raise StopJob()
@@ -189,8 +233,20 @@ class HlsDownloader:
             dbg_log(_DBG_PATH, f"ffmpeg 合成失败 exe={exe} rc={rc} ts={tsz}B err={detail[:600]}")
             raise RuntimeError(f"ffmpeg 合成失败 rc={rc}, 合并流 {tsz / 1048576:.1f}MB, "
                                f"输出: {detail[:140]}{kept}")
+        try:
+            os.replace(tmp_mp4, mp4)
+        except OSError as e:
+            try:
+                os.remove(tmp_mp4)
+            except OSError:
+                pass
+            raise RuntimeError(f"MP4 落盘失败: {e}") from e
         mb = os.path.getsize(mp4) / 1048576
-        os.remove(ts)
+        # 中间流清理失败（Windows 上文件可能被杀毒/索引占用）不应把成功的视频判失败
+        try:
+            os.remove(ts)
+        except OSError:
+            pass
         shutil.rmtree(parts, ignore_errors=True)
         return mb
 
@@ -250,7 +306,7 @@ class HlsDownloader:
         try:
             proc = subprocess.Popen(
                 [exe, "-y", "-loglevel", "error", "-i", ts,
-                 "-c", "copy", "-movflags", "+faststart", mp4],
+                 "-c", "copy", "-movflags", "+faststart", "-f", "mp4", mp4],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw)
             with self._ffmpeg_lock:
                 self._ffmpeg_procs.add(proc)

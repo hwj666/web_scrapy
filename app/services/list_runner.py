@@ -10,7 +10,7 @@ from app.core.models import JobConfig, ListPage, VideoItem
 from app.core.rules import RuleManager
 from app.services.domain import DomainProbe
 from app.services.job_state import JobState
-from app.toolkit.http import is_conn_error
+from app.toolkit.http import is_conn_error, should_retry_with_browser
 from app.toolkit.url import auto_list_url
 
 
@@ -58,6 +58,9 @@ class ListRunner:
             self.domain.set_base(list_url)
             if list_url not in cands:
                 self.log(f"本次实际使用链接: {list_url}")
+        # 换域名时只换了 host、路径可能已改版：校验真实列表页并按需修复路径
+        cfg.list_url = await self.domain.ensure_list_url(
+            cfg.list_url, cfg.p1, strict=True)
 
         state.set_stage("list", status="running")
         # 普通站先走静态/浏览器列表；加密 SPA 的 API 捕获只作为兜底。
@@ -83,15 +86,65 @@ class ListRunner:
 
         async def fetch_page(p: int) -> list[VideoItem]:
             url = auto_list_url(self.cfg.list_url, p)
-            html = await self._fetch(url, retries=2, timeout=20)
-            page_result: ListPage = await self.static_list.parse(html, p, self.cfg.base)
+            try:
+                html = await self._fetch(url, retries=2, timeout=20)
+            except (StopJob, JobAborted):
+                raise
+            except Exception as e:
+                # 只有「被 WAF/限流/连不上」才值得开浏览器重试；
+                # 404/410 说明路径就是不存在，开浏览器只会多等 20 多秒。
+                if self.browser_list is None or not should_retry_with_browser(e):
+                    raise
+                self.log(f"page {p} HTTP 取页失败({type(e).__name__}: {str(e)[:80]}), "
+                         f"改用浏览器")
+                async with self._new_page() as (page, _hits):
+                    await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(2000)
+                    html = await page.content()
+                    page_result = await self.static_list.parse(html, p, self.cfg.base)
+                    if page_result.items:
+                        return page_result.items
+                    result = await self.browser_list.parse_with_page(page, url, p)
+                    return result.items
+            try:
+                page_result: ListPage = await self.static_list.parse(
+                    html, p, self.cfg.base)
+            except (StopJob, JobAborted):
+                raise
+            except Exception as e:
+                # 静态解析器自身抛错（页面结构异常/正则问题）时不要整页当空，
+                # 直接落到浏览器兜底；两者都失败才由 load_page 记日志。
+                self.log(f"page {p} 静态解析失败: {type(e).__name__}: {str(e)[:100]}")
+                page_result = ListPage(page=p, items=[])
             if page_result.items:
+                # 有些站点标题是 JS 解密出来的（data-decrypt），静态解析只能拿到空标题；
+                # 这时用浏览器再解析一次，拿到真实标题再下载，避免全是 untitled。
+                if self.browser_list is not None and self._mostly_untitled(
+                        page_result.items):
+                    titled = await _browser_titles(url, p)
+                    if titled:
+                        return titled
                 return page_result.items
             if self.browser_list is not None:
                 async with self._new_page() as (page, _hits):
                     result = await self.browser_list.parse_with_page(page, url, p)
                 return result.items
             return []
+
+        async def _browser_titles(url: str, p: int) -> list[VideoItem] | None:
+            try:
+                async with self._new_page() as (page, _hits):
+                    result = await self.browser_list.parse_with_page(page, url, p)
+            except (StopJob, JobAborted):
+                raise
+            except Exception as e:
+                self.log(f"page {p} 浏览器补标题失败: {type(e).__name__}: "
+                         f"{str(e)[:100]}")
+                return None
+            if result.items and any(it.title for it in result.items):
+                self.log(f"page {p} 标题由浏览器解析(静态页标题为空)")
+                return result.items
+            return None
 
         async def load_page(p: int) -> list[VideoItem]:
             """抓一页；连接类错误先重探域名再试一次，其它错误记日志后当空页处理。"""
@@ -203,6 +256,14 @@ class ListRunner:
         for vi, item in added:
             self._dispatch(vi, item)
         return len(added)
+
+    @staticmethod
+    def _mostly_untitled(items: list[VideoItem]) -> bool:
+        """一半以上的条目没有标题，就认为标题需要浏览器(JS)才能拿到。"""
+        if not items:
+            return False
+        missing = sum(1 for it in items if not (it.title or "").strip())
+        return missing * 2 >= len(items)
 
     @staticmethod
     async def _cancel_pages(pending: dict[asyncio.Task, int]) -> None:

@@ -6,7 +6,12 @@ import os
 import tempfile
 import unittest
 
-from app.services.dedup_service import DedupService, _list_videos, _stage_kind
+from app.services.dedup_service import (
+    DedupService,
+    _decode_line,
+    _list_videos,
+    _stage_kind,
+)
 
 
 class DedupParsingTests(unittest.TestCase):
@@ -25,6 +30,24 @@ class DedupParsingTests(unittest.TestCase):
             open(os.path.join(tmp, "_vdf_db", "cached.mp4"), "wb").close()
             files = _list_videos(tmp)
             self.assertEqual([f["n"] for f in files], ["a.mp4"])
+
+    def test_list_videos_skips_own_intermediate_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a.mp4", "b.tmp.ts", "c.mp4.tmp", "d.tmp.mp4",
+                         "e.ts"):
+                open(os.path.join(tmp, name), "wb").close()
+            self.assertEqual([f["n"] for f in _list_videos(tmp)],
+                             ["a.mp4", "e.ts"])
+
+    def test_decode_line_handles_gbk_output(self) -> None:
+        # Windows 上 VDF 可能按系统代码页输出；不能因此匹配不到中文文件名
+        self.assertEqual(_decode_line("中文.mp4".encode()), "中文.mp4")
+        self.assertEqual(_decode_line("中文.mp4".encode("gb18030")), "中文.mp4")
+
+    def test_missing_result_file_is_empty_not_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                DedupService()._load_groups(os.path.join(tmp, "none.json")), [])
 
     def test_load_groups_marks_keep_and_wasted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
 
 
-def _rx(fragments: list[str], flags: int = 0) -> re.Pattern[str] | None:
+def _rx(fragments: Iterable[str] | None, flags: int = 0) -> re.Pattern[str] | None:
     """把一组正则片段拼成一个组合正则；空列表返回 None。"""
     frags = [f for f in (fragments or []) if f]
     return re.compile("|".join(frags), flags) if frags else None
@@ -85,6 +86,8 @@ class PipelineRules:
     publish_click_texts: tuple[str, ...] = ()
     # 从页面文字里提取新域名（正则里必须有一个分组是 host）
     new_domain_re: re.Pattern[str] | None = None
+    # 换域名后列表路径可能一起改版：这些模板用于 404 时探测可用路径
+    list_url_patterns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -169,6 +172,7 @@ class RuleManager:
                 p.get("publish_click_texts")
                 or ["進入", "进入", "继续访问", "点击进入", "新域名"]),
             new_domain_re=_rx(p.get("new_domain_patterns") or [], re.I),
+            list_url_patterns=tuple(p.get("list_url_patterns") or ()),
         )
 
         r = data.get("resolver") or {}

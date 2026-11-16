@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
@@ -126,6 +127,12 @@ app = FastAPI(title="视频下载流水线", lifespan=lifespan)
 
 
 # ---------------- 参数校验 ----------------
+def _pipeline_running() -> bool:
+    """当前是否有下载任务在跑（查重/清理要和它互斥）。"""
+    job = _current_job
+    return bool(job is not None and job.st.get("running"))
+
+
 def _build_job_config(body: dict) -> JobConfig:
     urls = split_urls(body.get("list_url", ""))
     if not urls:
@@ -135,7 +142,8 @@ def _build_job_config(body: dict) -> JobConfig:
         if up.scheme not in ("http", "https") or not up.netloc:
             raise ValueError(f"列表链接格式不对: {x} (例: https://xxx/xxxx/xxx)")
     try:
-        p1, p2 = int(body.get("p1")), int(body.get("p2"))
+        p1 = int(body.get("p1") or 0)
+        p2 = int(body.get("p2") or 0)
     except (TypeError, ValueError):
         raise ValueError("页码必须是数字") from None
     if not (1 <= p1 <= p2 <= 999):
@@ -202,12 +210,20 @@ async def api_events(request: Request):
     """任务状态 SSE：前端优先用它，断开时自动退回轮询。"""
 
     async def stream():
+        last_text: str | None = None
+        last_sent = 0.0
         while True:
             if await request.is_disconnected():
                 break
             job = _current_job
             payload = job.snapshot().model_dump() if job is not None else {"empty": True}
-            yield "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
+            text = json.dumps(payload, ensure_ascii=False)
+            now = time.monotonic()
+            # 状态没变就不重复推：任务空闲/完成时不再每秒刷一份全量快照；
+            # 15 秒一次心跳，保证前端能及时发现连接已断并退回轮询。
+            if text != last_text or now - last_sent >= 15:
+                yield "data: " + text + "\n\n"
+                last_text, last_sent = text, now
             await asyncio.sleep(1.0)
 
     return StreamingResponse(
@@ -216,6 +232,12 @@ async def api_events(request: Request):
 
 
 # ---------------- 任务控制 ----------------
+@app.get("/api/health")
+def api_health():
+    """轻量健康检查：给 Docker healthcheck / 反代探活使用。"""
+    return {"ok": True, "job_running": _pipeline_running(), "dedup_busy": dedup_svc.busy}
+
+
 @app.post("/api/start")
 async def api_start(request: Request):
     global _current_job
@@ -229,6 +251,9 @@ async def api_start(request: Request):
         cfg = _build_job_config(body)
     except ValueError as e:   # 含 pydantic ValidationError：都是参数问题，直接回给前端
         return {"ok": False, "error": str(e)}
+    if dedup_svc.busy:
+        return {"ok": False, "error": "查重扫描进行中，请先停止扫描再启动下载"
+                                      "（避免读到写了一半的文件）"}
     with _job_lock:
         if _current_job is not None and _current_job.st["running"]:
             return {"ok": False, "error": "已有任务在运行，请先停止当前任务"}
@@ -255,6 +280,8 @@ def api_stop():
 
 @app.post("/api/retry_failed")
 def api_retry_failed():
+    if dedup_svc.busy:
+        return {"ok": False, "error": "查重扫描进行中，请先停止扫描"}
     with _job_lock:
         job = _current_job
         if job is None:
@@ -272,6 +299,9 @@ def api_dedup_status():
 
 @app.post("/api/dedup/start")
 async def api_dedup_start(request: Request):
+    if _pipeline_running():
+        return {"ok": False, "error": "下载任务运行中，请等任务结束后再扫描"
+                                      "（避免扫描到写了一半的 MP4）"}
     try:
         body = await request.json()
     except Exception:
@@ -292,6 +322,8 @@ def api_dedup_stop():
 
 @app.post("/api/dedup/apply")
 async def api_dedup_apply(request: Request):
+    if _pipeline_running():
+        return {"ok": False, "error": "下载任务运行中，请等任务结束后再清理"}
     try:
         body = await request.json()
     except Exception:

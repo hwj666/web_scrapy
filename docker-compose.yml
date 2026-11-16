@@ -6,8 +6,18 @@ services:
   ys_web:
     image: ys_web:base
     container_name: ys_web
+    # 让 PID 1 交给 tini：ffmpeg/uvicorn 的子进程不会留成僵尸
+    init: true
     ports:
       - "8765:8765"
+    # uvicorn 收到 SIGTERM 后要收尾 ffmpeg/浏览器；Docker 默认只等 10 秒
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/venv/bin/python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     working_dir: /ys_web
     environment:
       - TZ=Asia/Shanghai

@@ -90,6 +90,8 @@ class FullPipelineTests(unittest.TestCase):
                     self.assertEqual(job.st["stages"]["out"]["count"], 1)
                     mp4s = [n for n in os.listdir(outdir) if n.endswith(".mp4")]
                     self.assertEqual(len(mp4s), 1, os.listdir(outdir))
+                    self.assertEqual(
+                        [n for n in os.listdir(outdir) if n.endswith(".tmp")], [])
                     self.assertGreater(os.path.getsize(os.path.join(outdir, mp4s[0])), 0)
                 finally:
                     job.dispose()

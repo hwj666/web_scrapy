@@ -10,12 +10,30 @@ from urllib.parse import urlparse
 from app.core.exceptions import JobAborted, StopJob
 from app.core.models import JobConfig
 from app.core.rules import RuleManager
+from app.services.list_url import (
+    DEFAULT_PATTERNS,
+    MAX_CANDIDATES,
+    _origin,
+    candidate_templates,
+    category_id,
+    is_detail_path,
+    is_list_route,
+    links_in,
+    pick_chain_host,
+    pick_link_for_host,
+    pick_new_site_link,
+    scheme_variants,
+    templates_from_homepage,
+    templates_from_url,
+    text_of_html,
+)
 from app.toolkit.codec import decode_body
 from app.toolkit.dns import cdn_alias
 from app.toolkit.domain_notice import (
     clean_host,
     close_pages,
-    page_notice_host,
+    find_new_url,
+    page_notice_target,
     page_opener_matches,
     replace_host,
 )
@@ -39,9 +57,10 @@ class DomainProbe:
         self._lock = threading.Lock()
         self._reprobe_at = 0.0
         # 每次域名切换 +1；HLS 下载器用它判断“是不是该丢弃旧 m3u8 重新解析”
-        self.epoch = 0
-        # 旧 host -> 新 host；换域名后历史上已入队的绝对 URL 也能重写
+        self.epoch = 0        # 旧 host -> 新 host；换域名后历史上已入队的绝对 URL 也能重写
         self._host_map: dict[str, str] = {}
+        # 发布页里给出的完整地址（可能带新站点的列表路径）
+        self._notice_url = ""
 
     def _remap(self, old_host: str, new_host: str) -> None:
         old = (old_host or "").lower()
@@ -52,6 +71,274 @@ class DomainProbe:
         for key, value in list(self._host_map.items()):
             if value == old:
                 self._host_map[key] = new
+
+    def _looks_like_list(self, content: bytes) -> bool:
+        """粗略判断页面是不是列表页：至少两个像播放页的链接。"""
+        if not content:
+            return False
+        text = decode_body(content, "")[:200000]
+        hint = self.rules.link.play_hint_re
+        if hint is None:
+            return len(text) > 2000
+        # 真列表页通常有大量详情链接；目录页/单条页不能算列表页
+        return len(hint.findall(text)) >= 5
+
+    def _looks_like_publish(self, content: bytes) -> bool:
+        """发布页/跳转页：带换域名提示、但几乎没有详情链接。"""
+        if not content:
+            return False
+        if self._looks_like_list(content):
+            return False
+        text = decode_body(content, "")[:30000]
+        return any(k in text for k in self.rules.pipeline.shell_hints)
+
+    async def _list_ok(self, tpl: str, p1: int = 1) -> bool:
+        try:
+            r = await self._get_raw(auto_list_url(tpl, p1))
+        except (StopJob, JobAborted):
+            raise
+        except Exception:
+            return False
+        return r.status < 400 and self._looks_like_list(r.content)
+
+    async def _follow_notice_chain(self, tpl: str, cat: str) -> str:
+        """跟随「换域名跳转页」链路：A 域名 → 跳转页 → 跳转页上写的新网址。
+
+        很多站的旧域名不会 30x 到新站，而是先跳到一个“发布页/说明页”，
+        上面才写着真正的新地址；只采纳第一跳域名会一直 404。
+        """
+        visited: set[str] = set()
+        for _ in range(5):
+            origin = _origin(tpl)
+            host = urlparse(origin).netloc.lower() if origin else ""
+            if not origin or not host or host in visited:
+                return tpl
+            visited.add(host)
+            # 换过域名后先验证当前域名是否已经有可用列表页；能用就停止跟随，
+            # 否则会跟着发布页里的广告/统计域名继续乱跳。
+            if await self._list_ok(tpl, self.cfg.p1):
+                self.log(f"当前域名列表页可用, 停止跟随跳转: {host}")
+                return tpl
+            try:
+                r = await self._get_raw(origin + "/")
+            except (StopJob, JobAborted):
+                raise
+            except Exception as e:
+                self.log(f"跳转页探测失败({type(e).__name__}): {str(e)[:80]}")
+                return tpl
+            html = (decode_body(r.content, r.headers.get("Content-Type", ""))
+                    if r.content else "")
+            final_host = clean_host(str(r.url))
+
+            # 1) HTTP 跳转到了另一个域名
+            if final_host and final_host != host:
+                self.log(f"跳转页指向新域名: {host} -> {final_host}")
+                if self.adopt_host(final_host):
+                    tpl = replace_host(tpl, {host}, final_host)
+                    continue
+
+            # 2) 页面上直接给出其它站点的列表链接（最可靠）
+            links = links_in(html, origin)
+            link = pick_new_site_link(links, visited | {host}, cat)
+            if link:
+                link_host = clean_host(link)
+                self.log(f"跳转页给出新站点列表地址: {link}")
+                tmpl_list = templates_from_url(link, cat) or [link]
+                if link_host and link_host not in visited:
+                    self.adopt_host(link_host)
+                self._notice_url = link
+                return tmpl_list[0]
+
+            # 3) 页面文字里写的新域名（可能同时带完整列表地址）
+            new_host, new_url = find_new_url(
+                text_of_html(html), self.rules.pipeline.new_domain_re,
+                visited | {host})
+            if not new_host:
+                # 4) 任意指向其它站点的链接（“点此进入新站”按钮）
+                for cand_link in links:
+                    cand_host = clean_host(cand_link)
+                    if cand_host and cand_host not in visited:
+                        new_host = cand_host
+                        break
+            if not new_host and not link:
+                # 地址发布页常把真实域名写进 <script>：JS 跳转/加密配置/入口链接
+                script_host = pick_chain_host(html, visited | {host})
+                if script_host:
+                    self.log(f"跳转页脚本里发现新域名: {host} -> {script_host}")
+                    if self.adopt_host(script_host):
+                        tpl = replace_host(tpl, {host}, script_host)
+                        continue
+
+            if not new_host and not link:
+                # 跳转页可能是 JS 渲染的：用浏览器读一次，再按上面同样的规则找
+                bhtml = await self._browser_html(origin + "/")
+                if bhtml and bhtml != html:
+                    blinks = links_in(bhtml, origin)
+                    blink = pick_new_site_link(blinks, visited | {host}, cat)
+                    if blink:
+                        bhost = clean_host(blink)
+                        self.log(f"跳转页(浏览器)给出新站点列表地址: {blink}")
+                        if bhost:
+                            self.adopt_host(bhost)
+                        self._notice_url = blink
+                        return (templates_from_url(blink, cat) or [blink])[0]
+                    new_host, new_url = find_new_url(
+                        text_of_html(bhtml), self.rules.pipeline.new_domain_re,
+                        visited | {host})
+                    if not new_host:
+                        script_host = pick_chain_host(bhtml, visited | {host})
+                        if script_host:
+                            self.log(f"跳转页(浏览器)脚本里发现新域名: "
+                                     f"{host} -> {script_host}")
+                            if self.adopt_host(script_host):
+                                tpl = replace_host(tpl, {host}, script_host)
+                                continue
+
+            if new_host:
+                self.log(f"跳转页提示新域名: {host} -> {new_host}")
+                adopted = self.adopt_host(new_host)
+                if new_url and is_list_route(new_url) and not is_detail_path(new_url):
+                    self.log(f"跳转页给出新站点列表地址: {new_url}")
+                    self._notice_url = new_url
+                    return (templates_from_url(new_url, cat) or [new_url])[0]
+                if adopted:
+                    tpl = replace_host(tpl, {host}, new_host)
+                    continue
+            return tpl
+        return tpl
+
+    async def _browser_html(self, url: str) -> str:
+        """用浏览器读页面 HTML（应对 JS 渲染或 WAF 拦截）。"""
+        try:
+            async with self._new_page() as (page, _hits):
+                await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+                await page.wait_for_timeout(2000)
+                return await page.content() or ""
+        except Exception as e:
+            self.log(f"浏览器读取失败 {url}: {type(e).__name__}: {str(e)[:80]}")
+            return ""
+
+    async def _homepage_templates(self, tpl: str, cat: str) -> list[str]:
+        """抓新站点首页，从它自己的链接里推导列表模板（比盲猜路由可靠）。"""
+        origin = _origin(tpl)
+        if not origin:
+            return []
+        html = ""
+        try:
+            r = await self._get_raw(origin + "/")
+            if r.status < 400 and r.content:
+                html = decode_body(r.content, r.headers.get("Content-Type", ""))
+                found = templates_from_homepage(html, origin, cat)
+                if found:
+                    self.log(f"从新域名首页发现 {len(found)} 个候选列表路径")
+                    return found
+                self.log("首页没有可用的分类链接, 改用浏览器读取首页")
+            else:
+                self.log(f"新域名首页返回 HTTP {r.status}, 改用浏览器读取首页")
+        except (StopJob, JobAborted):
+            raise
+        except Exception as e:
+            self.log(f"新域名首页抓取失败({type(e).__name__}), 改用浏览器: "
+                     f"{str(e)[:80]}")
+
+        # 首页由 JS 渲染或被 WAF 挡住时，用浏览器再读一次
+        html = await self._browser_html(origin + "/")
+        if not html:
+            return []
+        found = templates_from_homepage(html, origin, cat)
+        if found:
+            self.log(f"从新域名首页(浏览器)发现 {len(found)} 个候选列表路径")
+        return found
+
+    async def ensure_list_url(self, tpl: str, p1: int = 1,
+                              strict: bool = False) -> str:
+        """校验列表页是否可访问；404/不是列表页时尝试修复路径。
+
+        换域名时只替换 host 会保留旧路径，而站点经常连列表路由一起改版，
+        所以这里在拿到新域名后再验证一次真实页面。
+        """
+        if not tpl:
+            return tpl
+        try:
+            r0 = await self._get_raw(auto_list_url(tpl, p1))
+        except (StopJob, JobAborted):
+            raise
+        except Exception as e:
+            self.log(f"列表页校验失败({type(e).__name__}), 尝试探测新站点的列表路径: "
+                     f"{str(e)[:80]}")
+            r0 = None
+        # 原链接只要不是 4xx/5xx、也不是“发布页/跳转页”，就认为它是可用列表页；
+        # 小分类只有一两条视频，不能因为链接少就误判并去改路径。
+        if (r0 is not None and r0.status < 400
+                and not self._looks_like_publish(r0.content)):
+            return tpl
+        if r0 is not None:
+            self.log(f"列表页不可用(HTTP {r0.status}), 尝试探测新站点的列表路径")
+
+        # 先跟随「跳转页 → 跳转页上写的新网址」链路；只采纳第一跳域名会一直 404
+        chained = await self._follow_notice_chain(tpl, cat=category_id(tpl))
+        if chained and chained != tpl:
+            tpl = chained
+            try:
+                r1 = await self._get_raw(auto_list_url(tpl, p1))
+            except (StopJob, JobAborted):
+                raise
+            except Exception:
+                r1 = None
+            if r1 is not None and r1.status < 400 and self._looks_like_list(r1.content):
+                self.remember_list_url(tpl)
+                self.log(f"列表路径已修复: {tpl}")
+                return tpl
+
+        cat = category_id(tpl)
+        cands: list[str] = []
+        # 1) 发布页给出的完整地址（最可信）
+        if self._notice_url:
+            cands.extend(templates_from_url(self._notice_url, cat))
+            cands.append(self._notice_url)
+        # 2) 新站点首页自己的链接（分类 id 或路由前缀）
+        cands.extend(await self._homepage_templates(tpl, cat))
+        # 3) 常见路由模板
+        patterns = self.rules.pipeline.list_url_patterns or DEFAULT_PATTERNS
+        cands.extend(candidate_templates(tpl, patterns))
+        # 4) https/http 互备（换域名后协议经常不一致）
+        for cand in list(cands):
+            cands.extend(scheme_variants(cand))
+
+        tried = 0
+        for cand in dict.fromkeys(cands):
+            if tried >= MAX_CANDIDATES:
+                break
+            if not cand or cand.rstrip("/") == tpl.rstrip("/"):
+                continue
+            if is_detail_path(cand):
+                continue
+            tried += 1
+            try:
+                r = await self._get_raw(auto_list_url(cand, p1))
+            except (StopJob, JobAborted):
+                raise
+            except Exception:
+                continue
+            if r.status < 400 and self._looks_like_list(r.content):
+                self.log(f"列表路径已修复: {cand}")
+                self.remember_list_url(cand)
+                self._notice_url = ""
+                return cand
+        msg = (f"列表页不可用且无法自动修复（已尝试 {tried} 个候选路径）。"
+               f"站点可能已换域名或改版、分类 id 也可能变了，"
+               f"请把新站点的列表页链接填进任务，"
+               f"例如：{_origin(tpl)}/vodshow/分类id--------1---.html")
+        self.log(msg)
+        if strict:
+            # 立刻失败，别再去逐页解析/开浏览器白跑几分钟
+            raise RuntimeError(msg)
+        return tpl
+
+    def remember_list_url(self, tpl: str) -> None:
+        """把修复后的列表模板加入候选，后续重探/换域名都优先用可用路径。"""
+        if tpl and tpl not in self.cfg.candidates:
+            self.cfg.candidates.append(tpl)
 
     def set_base(self, list_url: str) -> None:
         old_host = urlparse(self.cfg.base).netloc
@@ -131,6 +418,18 @@ class DomainProbe:
             body = ""
         return f"{title}\n{body}"[:50000]
 
+    @staticmethod
+    async def _page_links(page) -> list[str]:
+        """发布页上的链接：常常直接给出新站点的列表地址，比页面文字更可靠。"""
+        try:
+            got = await page.evaluate(
+                "() => [...document.querySelectorAll('a[href]')].map(a => a.href)")
+        except Exception:
+            return []
+        if not isinstance(got, list):
+            return []
+        return [str(x) for x in got if x]
+
     async def resolve_base(self, cand: str, p1: int = 1) -> str | None:
         tpl = cand.strip()
         probe = auto_list_url(tpl, p1)
@@ -181,7 +480,7 @@ class DomainProbe:
                             break
                         await page.wait_for_timeout(500)
                 exclude = {urlparse(self.cfg.base).netloc.lower()}
-                host = await page_notice_host(
+                host, notice_url = await page_notice_target(
                     page, self.rules.pipeline.new_domain_re,
                     self.rules.pipeline.shell_hints, exclude)
                 for popup in popups:
@@ -192,10 +491,18 @@ class DomainProbe:
                         pass
                     if host:
                         continue
-                    host = await page_notice_host(
+                    host, notice_url = await page_notice_target(
                         popup, self.rules.pipeline.new_domain_re,
                         self.rules.pipeline.shell_hints, exclude)
                 if host:
+                    cat = category_id(tpl)
+                    links: list[str] = []
+                    for pg in [page, *popups]:
+                        links.extend(await self._page_links(pg))
+                    picked = pick_link_for_host(links, host, cat)
+                    self._notice_url = notice_url or picked or ""
+                    if self._notice_url:
+                        self.log(f"发布页给出了新站点地址: {self._notice_url}")
                     tpl = self._adopt_notice_host(tpl, host)
                 else:
                     tpl = self._adopt_redirect(tpl, page.url)

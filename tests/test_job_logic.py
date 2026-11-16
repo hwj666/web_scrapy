@@ -124,6 +124,10 @@ class ListConcurrencyTests(unittest.TestCase):
 
                 job.list_runner._fetch = fake_fetch         # type: ignore[union-attr]
                 job.domain.resolve_base = fake_resolve_base  # type: ignore[assignment]
+                async def fake_ensure_list_url(tpl, p1=1, strict=False):
+                    return tpl
+
+                job.domain.ensure_list_url = fake_ensure_list_url  # type: ignore[assignment]
                 job._work = fake_work                        # type: ignore[assignment]
                 job._ensure_parsers = lambda: None            # type: ignore[assignment]
 

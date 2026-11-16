@@ -48,6 +48,8 @@ RUN mkdir -p /opt/vdf-state/VDF/ai && \
     rm -rf /tmp/ort.tgz /tmp/onnxruntime-linux-x64-* && \
     ls -l /opt/vdf-state/VDF/ai
 
+# 注意: 这里的 playwright 版本必须与 pyproject.toml 保持一致（当前 1.65.2）。
+# 只装浏览器二进制，不做 uv sync；依赖由 docker-compose 的 command 在启动时同步。
 RUN uv run --with playwright==1.65.2 playwright install --with-deps chromium && \
     chmod -R 755 /ms-playwright && \
     uv cache clean && \

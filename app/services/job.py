@@ -249,13 +249,10 @@ class Job:
                 self.st["error"] = str(e)
             self.log(f"任务中止: {e}")
             await self._finish(error=True)
-        except ValueError as e:
-            with self.state.lock:
-                self.st["error"] = str(e)
-            self.log(f"参数错误: {e}")
-            await self._finish(error=True)
         except Exception as e:
-            # 完整 traceback 落到 _server_dbg.log，界面只显示异常类型+消息
+            # 完整 traceback 落到 _server_dbg.log，界面只显示异常类型+消息。
+            # 注意别把 ValueError 单独当成「参数错误」：任务启动前配置已校验，
+            # 运行期出现的 ValueError 大多是代码/页面解析问题，应留下 traceback。
             with self.state.lock:
                 self.st["error"] = f"{type(e).__name__}: {e}"
             self.log(f"FATAL: {type(e).__name__}: {e}")

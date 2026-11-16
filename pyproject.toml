@@ -14,6 +14,14 @@ dependencies = [
     "pyyaml",
 ]
 
+[dependency-groups]
+# 开发/测试工具（uv sync 默认安装；生产可用 uv sync --no-dev 跳过）
+dev = [
+    "pytest>=8",
+    "mypy",
+    "ruff",
+]
+
 [tool.ruff]
 line-length = 110
 target-version = "py311"
