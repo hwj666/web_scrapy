@@ -23,12 +23,12 @@ from typing import Any
 
 from app.core.exceptions import JobAborted, NewDomainError, StopJob
 from app.core.models import JobConfig, JobSnapshot, VideoItem
-from app.core.plugins import PluginContext
+from app.core.parsing import ParserContext
 from app.core.rules import RuleManager
-from app.plugins.browser_list import BrowserListParser
-from app.plugins.browser_resolver import BrowserResolver
-from app.plugins.static_list import StaticListParser
-from app.plugins.static_resolver import StaticResolver
+from app.parsers.list.browser import BrowserListParser
+from app.parsers.list.static import StaticListParser
+from app.parsers.play.browser import BrowserResolver
+from app.parsers.play.static import StaticResolver
 from app.services.browser import BrowserSession
 from app.services.domain import DomainProbe
 from app.services.hls import HlsDownloader
@@ -118,10 +118,10 @@ class Job:
     def _progress(self) -> None:
         self.state.progress()
 
-    # ---------- 插件 / 运行时 ----------
-    def _ensure_plugins(self) -> None:
+    # ---------- 解析器 / 运行时 ----------
+    def _ensure_parsers(self) -> None:
         """实例化内置解析器，并把它们接到列表流水线与单视频 worker 上。"""
-        ctx = PluginContext(fetch=self._fetch, cfg=self.cfg.model_dump(),
+        ctx = ParserContext(fetch=self._fetch, cfg=self.cfg.model_dump(),
                             state={"rules": self.rules})
         self._static_list = StaticListParser(ctx)
         self._browser_list = BrowserListParser(ctx)
@@ -240,7 +240,7 @@ class Job:
     async def _async_run(self) -> None:
         self._init_async()
         try:
-            self._ensure_plugins()
+            self._ensure_parsers()
             await self._run()
         except StopJob:
             await self._finish(stopped=True)

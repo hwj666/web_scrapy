@@ -10,10 +10,10 @@ from unittest.mock import patch
 
 from app.core.exceptions import DomainChanged, NewDomainError
 from app.core.models import JobConfig, ListPage, VideoItem
-from app.core.plugins import PluginContext
+from app.core.parsing import ParserContext
 from app.core.rules import RuleManager
-from app.plugins.static_list import StaticListParser
-from app.plugins.static_resolver import StaticResolver
+from app.parsers.list.static import StaticListParser
+from app.parsers.play.static import StaticResolver
 from app.services.domain import DomainProbe
 from app.services.hls import HlsDownloader
 from app.services.job_state import JobState
@@ -356,7 +356,7 @@ class DomainNoticeTests(unittest.TestCase):
         async def fetch(url: str) -> str:
             return "<html><body>最新地址：new-site.com</body></html>"
 
-        resolver = StaticResolver(PluginContext(
+        resolver = StaticResolver(ParserContext(
             fetch=fetch, state={"rules": RuleManager()}))
         with self.assertRaises(NewDomainError) as ctx:
             asyncio.run(resolver.resolve(

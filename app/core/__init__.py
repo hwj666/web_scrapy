@@ -1,4 +1,4 @@
-"""ys_web 核心抽象层：模型、插件接口、规则引擎。"""
+"""ys_web 核心抽象层：模型、解析器接口、规则引擎。"""
 
 from .models import (
     AppConfig,
@@ -10,7 +10,7 @@ from .models import (
     VideoItem,
     VideoState,
 )
-from .plugins import PluginContext
+from .parsing import ParserContext
 
 __all__ = [
     "AppConfig",
@@ -21,5 +21,5 @@ __all__ = [
     "VideoState",
     "JobSnapshot",
     "DedupConfig",
-    "PluginContext",
+    "ParserContext",
 ]

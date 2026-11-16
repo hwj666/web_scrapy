@@ -8,9 +8,9 @@ from contextlib import asynccontextmanager
 
 from app.core.exceptions import NewDomainError
 from app.core.models import JobConfig, VideoItem
-from app.core.plugins import PluginContext
+from app.core.parsing import ParserContext
 from app.core.rules import RuleManager
-from app.plugins.browser_resolver import BrowserResolver
+from app.parsers.play.browser import BrowserResolver
 from app.services.domain import DomainProbe
 from app.toolkit.http import FetchedResponse
 
@@ -105,7 +105,7 @@ class BrowserPopupTests(unittest.TestCase):
         async def fetch(*_args, **_kwargs):
             return ""
 
-        resolver = BrowserResolver(PluginContext(
+        resolver = BrowserResolver(ParserContext(
             fetch=fetch, state={"rules": RuleManager()}))
 
         item = VideoItem(id="https://old.com/play/1.html", title="x")

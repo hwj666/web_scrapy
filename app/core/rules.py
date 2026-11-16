@@ -1,7 +1,7 @@
 """规则引擎：把散落在各模块里的正则/关键词/阈值统一收敛到 rules/*.yaml。
 
-运行期由 `RuleManager` 一次性加载并编译，插件与 Job 通过它取得已编译规则，
-不再各自硬编码。新增/调整规则只改 YAML，不改代码；新站点则写一个新插件文件。
+运行期由 `RuleManager` 一次性加载并编译，解析器与 Job 通过它取得已编译规则，
+不再各自硬编码。新增/调整规则只改 YAML，不改代码；新站点则写一个新解析器文件。
 """
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ class BrowserRules:
 
 
 class RuleManager:
-    """加载并编译 rules/*.yaml，插件/Job 唯一取数入口。"""
+    """加载并编译 rules/*.yaml，解析器/Job 唯一取数入口。"""
 
     def __init__(self, rule_dir: str | None = None) -> None:
         self.rule_dir = rule_dir or os.path.join(

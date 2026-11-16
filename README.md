@@ -6,7 +6,7 @@
 
 > 设计原则：不含任何站点专用逻辑。所有站点适配都靠**通用策略链（静态正则 → 加密
 > blob 试解 → 无头浏览器兜底）**完成；**规则全部外置到 `app/rules/*.yaml`**，换站只改
-> YAML 或新增一个插件文件，不改核心代码；站点换域名只改界面上的链接。
+> YAML 或新增一个解析器文件，不改核心代码；站点换域名只改界面上的链接。
 
 ---
 
@@ -17,10 +17,10 @@
 | `main.py` | FastAPI 入口：路由、参数校验、lifespan（孤儿 chromium 清理、崩溃日志）、静态页 |
 | `index.html` | 单页控制台（原生 JS，无构建步骤） |
 | `app/core/models.py` | Pydantic 模型：`JobConfig` / `VideoItem` / `JobSnapshot` / `DedupConfig` 等 |
-| `app/core/plugins.py` | 解析器接口（`ListParserPlugin` / `ResolverPlugin`）+ 运行期上下文；解析器在 `Job` 里显式实例化 |
-| `app/core/rules.py` | **规则引擎 `RuleManager`**：加载并编译 `rules/*.yaml`，插件/Job 唯一取数入口 |
+| `app/core/parsing.py` | 解析器接口（`ListParser` / `Resolver`）+ 运行期上下文 `ParserContext`；解析器在 `Job` 里显式实例化 |
+| `app/core/rules.py` | **规则引擎 `RuleManager`**：加载并编译 `rules/*.yaml`，解析器/Job 唯一取数入口 |
 | `app/core/exceptions.py` | `StopJob` / `JobAborted` 流水线专用异常 |
-| `app/plugins/` | 解析插件：`static_list` / `static_resolver` / `browser_list` / `browser_resolver` |
+| `app/parsers/` | 解析器实现：`list/static` / `list/browser` / `play/static` / `play/browser` |
 | `app/rules/` | **规则配置（单一来源）**：`title_rules.yaml` / `link_rules.yaml` / `pipeline_rules.yaml` |
 | `app/services/job.py` | **任务编排 `Job`**：组合列表解析、单视频 worker、HLS、浏览器/域名探测 |
 | `app/services/job_state.py` | **任务状态 `JobState`**：状态/进度/快照/视频队列/日志缓冲/熔断计数 |
@@ -121,7 +121,7 @@ flowchart TD
 
 ---
 
-## 4. 规则与插件（换站不用改代码）
+## 4. 规则与解析器（换站不用改代码）
 
 ### 4.1 规则外置
 
@@ -133,17 +133,17 @@ flowchart TD
   发布页提示、跳转信号、m3u8 正则、加密 blob 形态、浏览器触发/标题候选选择器、
   发布页按钮文字、页面新域名识别正则。
 
-### 4.2 插件化解析
+### 4.2 解析器策略
 
-列表页与播放页解析都是 `ListParserPlugin` / `ResolverPlugin` 的实现，在 `Job._ensure_plugins()`
+列表页与播放页解析都是 `ListParser` / `Resolver` 的实现，在 `Job._ensure_parsers()`
 里**显式实例化**四种内置解析器（静态/浏览器 × 列表/播放页），依次「静态优先、浏览器兜底」。
 
 新站点适配：
 
 1. 若只需调整链接/标题规则 → 改 `app/rules/*.yaml`；
-2. 若站点的页面结构特殊 → 在 `app/plugins/` 下新增一个 `xxx_list.py` / `xxx_resolver.py`，
-   继承对应基类并实现 `parse` / `resolve`（`uses_browser=True` 的可实现 `*_with_page`），
-   然后在 `Job._ensure_plugins()` 里登记它。
+2. 若站点的页面结构特殊 → 在 `app/parsers/` 下新增一个解析器文件，继承对应基类并实现
+   `parse` / `resolve`（`uses_browser=True` 的可实现 `*_with_page`），
+   然后在 `Job._ensure_parsers()` 里登记它。
 
 ### 4.3 标题提取（`app/toolkit/title.py`）
 
@@ -283,9 +283,9 @@ uv run python -m pytest -q
 ## 8. 重构与优化要点
 
 1. **规则单一来源**：散落在 `parser_*.py` / `job.py` / `utils.py` 里的正则、关键词、阈值全部
-   收敛到 `app/rules/*.yaml`，由 `RuleManager` 统一编译；插件不再硬编码规则。
-2. **插件显式注册**：`Job._ensure_plugins()` 直接实例化四种内置解析器，新站点在 `app/plugins/`
-   新增插件文件并在此登记即可。
+   收敛到 `app/rules/*.yaml`，由 `RuleManager` 统一编译；解析器不再硬编码规则。
+2. **解析器显式组装**：`Job._ensure_parsers()` 直接实例化四种内置解析器，新站点在 `app/parsers/`
+   新增解析器文件并在此登记即可。
 3. **依赖倒置**：`main.py` 只依赖 `app.services` 与 `app.core`，不再 import 旧模块。
 4. **完整流水线**：新 `Job` 补齐浏览器兜底、域名探测/重探、一键重试、熔断、磁盘检查、日志落盘。
 5. **前端契约不变**：`JobSnapshot` 的字段与 `index.html` 约定完全对齐，控制台无需改动即可工作。
