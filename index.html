@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>视频下载流水线</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{--bg:#0b1020;--card:#131a2e;--bd:#26304d;--tx:#e8edf7;--mut:#8fa0c0;
+--acc:#4f8cff;--ok:#2ecc71;--err:#ff5c6c;--warn:#ffb020}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.6 "Segoe UI",system-ui,"Microsoft YaHei",sans-serif;padding:20px;max-width:1280px;margin:0 auto}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+h1{font-size:20px;display:inline}
+.sub{color:var(--mut);font-size:12px;margin-left:10px}
+.top-right{display:flex;align-items:center;gap:14px}
+.pill{padding:4px 14px;border-radius:999px;font-size:13px;border:1px solid var(--bd);color:var(--mut)}
+.pill.run{color:#cfe0ff;background:rgba(79,140,255,.16);border-color:var(--acc);animation:pulse 1.2s infinite}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.err{color:var(--err);border-color:var(--err)}
+.pill.stop{color:var(--warn);border-color:var(--warn)}
+.pct{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums}
+.bar-wrap{height:8px;background:#1a2340;border-radius:6px;overflow:hidden}
+.bar{height:100%;width:0;background:linear-gradient(90deg,var(--acc),#7ab8ff);transition:width .6s}
+.meta-row{color:var(--mut);font-size:12.5px;margin:6px 0 0}
+#metaRow{margin:10px 0 14px}
+/* 任务设置: 用网格对齐, 避免 flex 换行时字段错位 */
+.set-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px 12px}
+.set-grid .field{margin-bottom:0}
+.set-grid .f6{grid-column:span 6}
+.set-grid .f2{grid-column:span 2}
+.cfg-bar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.cfg-bar .field{flex:0 0 110px;margin-bottom:0}
+.cfg-bar .field.grow{flex:1 1 220px}
+.field{margin-bottom:8px}
+.field label{display:block;font-size:11px;color:var(--mut);margin-bottom:3px}
+.field input,.field select{width:100%;background:#0e1428;border:1px solid var(--bd);color:var(--tx);border-radius:7px;padding:6px 8px;font-size:12.5px;outline:none}
+.field input:focus,.field select:focus{border-color:var(--acc)}
+.controls{display:flex;align-items:center;gap:10px;margin:0 0 14px;flex-wrap:wrap}
+.act-group{margin-left:auto;display:flex;gap:10px;flex-wrap:wrap}
+button{cursor:pointer;border:1px solid var(--bd);background:#182342;color:var(--tx);padding:9px 18px;border-radius:9px;font-size:14px}
+button:hover:not(:disabled){border-color:var(--acc)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.primary{background:linear-gradient(135deg,#3f7dff,#5ea0ff);border:none;font-weight:600;color:#fff}
+button.danger{background:rgba(255,92,108,.12);border-color:var(--err);color:var(--err)}
+.panel{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;margin:0 0 14px}
+.p-title{font-size:13px;font-weight:600;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.mini{font-size:11px;color:var(--mut);font-weight:400;display:flex;gap:4px;align-items:center;cursor:pointer}
+pre#log{max-height:300px;overflow:auto;font:11.5px/1.7 Consolas,monospace;color:#9fb3d9;white-space:pre-wrap}
+.help{color:var(--mut);font-size:12.5px}
+#toast{position:fixed;right:20px;bottom:20px;background:#1c2745;border:1px solid var(--acc);color:var(--tx);padding:10px 16px;border-radius:10px;font-size:13px;opacity:0;transform:translateY(8px);transition:.3s;pointer-events:none;max-width:420px}
+#toast.show{opacity:1;transform:none}
+#toast.err{border-color:var(--err)}
+@keyframes pulse{50%{opacity:.65}}
+/* 尊重系统的「减少动态效果」设置 */
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important;transition:none!important}
+}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+*{scrollbar-width:thin;scrollbar-color:#2b3a63 transparent}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#2b3a63;border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+.list-stat{margin-left:auto;font-size:12px;color:var(--mut);font-weight:400}
+#vFilter{margin-left:8px;background:#0e1428;border:1px solid var(--bd);color:var(--tx);border-radius:7px;padding:4px 8px;font-size:12px;outline:none}
+.vlist{max-height:400px;overflow:auto;margin-top:8px}
+.vrow{display:flex;align-items:center;gap:10px;padding:5px 8px;border-bottom:1px solid #1b2440;font-size:12.5px}
+.vrow.run{background:rgba(79,140,255,.09)}
+.vrow.fail{background:rgba(255,92,108,.06)}
+.v-i{color:#5d6f96;min-width:32px;text-align:right;flex:none;font-variant-numeric:tabular-nums}
+.v-t{flex:0 1 300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tx)}
+.v-link{color:#7fb0ff;text-decoration:none}
+.v-link:hover{text-decoration:underline}
+.v-steps{display:flex;gap:4px;flex:none;flex-wrap:wrap}
+.vs{font-size:10.5px;padding:1px 8px;border-radius:999px;border:1px solid #26304d;color:#5d6f96;white-space:nowrap}
+.vs.on{color:var(--ok);border-color:rgba(46,204,113,.45)}
+.vs.act{color:#9cc2ff;border-color:var(--acc);animation:pulse 1.2s infinite}
+.v-e{flex:0 1 180px;font-size:11px;color:var(--err);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.v-r{margin-left:auto;flex:none;font-size:11px;color:var(--mut)}
+.v-r.ok{color:var(--ok)}.v-r.err{color:var(--err)}.v-r.warn{color:var(--warn)}.v-r.run{color:#9cc2ff}
+/* ===== 重复视频检测 (VDF) ===== */
+#dupWarn{margin:0 0 10px;padding:8px 10px;border:1px solid var(--warn);border-radius:8px;background:rgba(255,176,32,.09);color:var(--warn);font-size:12.5px}
+#dupWarn b{color:var(--tx)}
+.dup-prog-meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin-top:6px}
+.dup-prog-meta b{color:var(--tx);font-variant-numeric:tabular-nums}
+.dup-cur{flex:1 1 240px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#dupGroups{max-height:520px;overflow:auto}
+.dup-grp{border:1px solid var(--bd);border-radius:9px;margin:10px 0;overflow:hidden}
+.dup-grp-h{padding:7px 10px;background:#0f1730;font-size:12.5px;font-weight:600}
+.dup-grp-h .wasted{color:var(--warn)}
+.dup-row{display:flex;align-items:center;gap:8px;padding:5px 10px;border-top:1px solid #1b2440;font-size:12px}
+.dup-badge{flex:none;font-size:10.5px;line-height:1.6;padding:0 8px;border-radius:999px;border:1px solid}
+.dup-badge.keep{color:var(--ok);border-color:rgba(46,204,113,.5);background:rgba(46,204,113,.1)}
+.dup-badge.del{color:var(--err);border-color:rgba(255,92,108,.5);background:rgba(255,92,108,.08)}
+.dup-name{flex:1 1 120px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tx)}
+.dup-kv{flex:none;color:var(--mut);font-size:11.5px;font-variant-numeric:tabular-nums}
+.dup-tag{flex:none;font-size:10px;line-height:1.6;padding:0 7px;border-radius:999px;border:1px solid var(--acc);color:#9cc2ff}
+pre#dupOut{max-height:220px;overflow:auto;font:11.5px/1.7 Consolas,monospace;color:#9fb3d9;white-space:pre-wrap;background:#0e1428;border:1px solid var(--bd);border-radius:8px;padding:8px 10px;margin-top:8px}
+.dup-flist{max-height:250px;overflow:auto;border:1px solid var(--bd);border-radius:9px;margin:4px 0 4px}
+.dup-frow{display:flex;align-items:center;gap:8px;padding:4px 10px;border-top:1px solid #1b2440;font-size:12px}
+.dup-frow:first-child{border-top:0}
+.dup-frow.cur{background:rgba(80,140,255,.10)}
+.dup-fname{flex:1 1 140px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dup-frow.done .dup-fname{color:var(--mut)}
+.dup-fsz{flex:none;color:var(--mut);font-size:11.5px;font-variant-numeric:tabular-nums}
+.dstep{flex:none;font-size:10.5px;padding:1px 7px;border-radius:999px;border:1px solid var(--bd);color:#6b7a99;line-height:1.6}
+.dstep.on{color:#9cc2ff;border-color:var(--acc);background:rgba(80,140,255,.12)}
+.dstep.done{color:var(--ok);border-color:rgba(46,204,113,.45)}
+.dup-ai{font-size:11px;font-weight:400;padding:1px 9px;border-radius:999px;border:1px solid rgba(46,204,113,.45);color:var(--ok)}
+.dup-ai.off{color:var(--mut);border-color:var(--bd)}
+.dup-sep{margin:16px 0 2px;padding-top:12px;border-top:1px solid var(--bd);font-size:12.5px;color:var(--mut)}
+@media (max-width:860px){
+  body{padding:12px}
+  header{flex-wrap:wrap;gap:8px}
+  .set-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .set-grid .f6,.set-grid .f2{grid-column:span 2}
+  .act-group{margin-left:0}
+  .v-t{flex-basis:150px}
+  .pct{font-size:22px}
+}
+@media (max-width:520px){
+  .set-grid{grid-template-columns:1fr}
+  .set-grid .f6,.set-grid .f2{grid-column:span 1}
+  .controls button{flex:1 1 auto}
+  .vrow{gap:6px}
+}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>⚡ 视频下载流水线</h1><span class="sub">HLS / AES-128 本地下载工具</span></div>
+  <div class="top-right"><div class="pill" id="pill">空闲</div><div class="pct" id="pct">0%</div></div>
+</header>
+<div class="bar-wrap"><div class="bar" id="bar"></div></div>
+<div class="meta-row" id="metaRow" aria-live="polite">等待任务…</div>
+<div class="meta-row" id="jobCfg" style="display:none"></div>
+
+<section class="panel">
+  <div class="p-title">⚙️ 任务设置</div>
+  <div class="set-grid">
+    <div class="field f6"><label for="f_url">视频列表页链接（用 <b>{}</b> 标记页码位置，多个备用域名用逗号分隔）</label><input id="f_url" placeholder="https://example.com/vodtype/1-{}.html"></div>
+    <div class="field"><label for="f_p1">起始页</label><input id="f_p1" type="number" value="1" min="1"></div>
+    <div class="field"><label for="f_p2">结束页</label><input id="f_p2" type="number" value="1" min="1"></div>
+    <div class="field f2"><label for="f_out">输出目录</label><input id="f_out" placeholder="留空=服务端默认 (NAS: /downloads)"></div>
+    <div class="field"><label for="f_workers">并发</label><select id="f_workers">
+      <option>1</option><option selected>2</option><option>3</option><option>4</option></select></div>
+    <div class="field"><label for="f_segs">分片并发</label><input id="f_segs" type="number" value="8" min="1" max="24" step="1"></div>
+    <div class="field"><label for="dupPct">查重相似度 %</label><input id="dupPct" type="number" value="96" min="50" max="100" step="1"></div>
+  </div>
+</section>
+
+<section class="controls">
+  <button id="btnRun" class="primary">▶ 运行流水线</button>
+  <button id="btnRetry" class="danger" style="display:none">🔁 重试失败/未完成 <b id="retryN">0</b></button>
+  <div class="act-group">
+    <button id="dupScan" class="primary" disabled>🔍 扫描重复视频</button>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="p-title">🎞 视频队列 · 每部视频独立步骤
+    <span class="list-stat" id="listStat"></span>
+    <select id="vFilter" aria-label="视频筛选">
+      <option value="all">全部</option>
+      <option value="run">排队/进行中</option>
+      <option value="done">完成/验证</option>
+      <option value="fail">失败/跳过</option>
+    </select>
+  </div>
+  <div class="vlist" id="vlist"><div class="vrow" style="border:0;color:var(--mut)">等待任务…</div></div>
+</section>
+
+<section class="panel">
+  <div class="p-title">📜 实时日志
+    <label class="mini"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+  </div>
+  <pre id="log"></pre>
+</section>
+
+<section class="panel" id="dupPanel" style="display:none">
+  <div class="p-title">🧬 重复视频检测结果
+    <span class="list-stat" id="dupStat"></span>
+    <span class="dup-ai off" id="dupAi">AI 匹配：关</span>
+  </div>
+  <div id="dupWarn" style="display:none">⚠️ 未检测到 <b>videoduplicatefinder</b> CLI：请安装 vdf / vdf-cli 并加入 PATH，或用环境变量 <b>VDF_BIN</b> 指定可执行文件绝对路径。安装后才能按画面相似度查重（不是文件哈希）。</div>
+  <div id="dupProgress" style="display:none">
+    <div class="bar-wrap" style="margin-top:2px"><div class="bar" id="dupBar"></div></div>
+    <div class="dup-prog-meta">
+      <span>进度 <b id="dupPctTxt">0%</b></span>
+      <span class="dup-cur" id="dupCur"></span>
+      <span>已用 <b id="dupEla">00:00</b></span>
+    </div>
+  </div>
+  <div id="dupFiles" style="display:none">
+    <div class="dup-prog-meta" style="margin:0 0 4px"><span id="dupFilesStat"></span></div>
+    <div class="dup-flist" id="dupFileList"></div>
+  </div>
+  <div class="meta-row" id="dupSummary" style="display:none;margin:12px 0 4px"></div>
+  <div class="meta-row" id="dupErr" style="display:none;margin:0 0 6px;color:var(--err)"></div>
+  <div id="dupGroups"></div>
+  <div class="dup-sep"></div>
+  <div class="cfg-bar">
+    <div class="field grow"><label for="dupStrategy">清理策略</label><select id="dupStrategy">
+      <option value="lowest-quality">保留码率/分辨率最高</option>
+      <option value="smallest-file">保留体积最大</option>
+      <option value="shortest-duration">保留时长最长</option>
+      <option value="worst-resolution">保留分辨率最高</option>
+      <option value="100-percent-only">仅处理 100% 相同</option>
+    </select></div>
+    <div class="field grow"><label for="dupMode">清理模式</label><select id="dupMode">
+      <option value="dry-run">仅预览，不删除</option>
+      <option value="trash">移到回收站</option>
+      <option value="permanent">永久删除</option>
+    </select></div>
+    <button id="dupApply" disabled>🧹 执行清理</button>
+  </div>
+  <div class="help" id="dupApplyInfo" style="margin-bottom:4px"></div>
+  <pre id="dupOut" style="display:none"></pre>
+</section>
+
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const FIELDS = ["f_url","f_p1","f_p2","f_out","f_workers","f_segs"];
+const SAVED = FIELDS.concat(["dupPct"]);   // dupPct 也要记住, 但不随任务运行禁用
+let lastLogSeq = 0, running = false, emptyState = false;
+const MAX_LOG_LINES = 800;   // DOM 里只留最近 N 行, 长任务不会把页面拖慢
+
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function fmtT(s){s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60,p=n=>String(n).padStart(2,"0");return h?`${p(h)}:${p(m)}:${p(x)}`:`${p(m)}:${p(x)}`;}
+
+const S_NAME={0:"排队中",1:"进行中",2:"完成",3:"失败",4:"跳过"};
+const S_CLS={1:"run",2:"ok",3:"err",4:"warn"};
+let lastVseq=-1,lastFilter="all";
+
+function vChips(v){
+  const done=v.s===2, st=done?5:v.step, live=v.s===1;
+  const c=(name,on,act)=>`<i class="vs${on?" on":""}${act?" act":""}">${name}</i>`;
+  return c("播放页",st>=1,live&&st===0)
+    +c("密钥",st>=2)
+    +c(st>=3?`分片 ${v.sd||0}/${v.sn||0}`:"分片",st>=4||done,live&&st===3)
+    +c("合成",st>=5||done,live&&st===4);
+}
+
+function vRow(v){
+  return `<div class="vrow${v.s===1?" run":""}${v.s===3?" fail":""}" id="vr-${v.i}">`
+    +`<span class="v-i">${v.i}</span>`
+    +`<span class="v-t">`+(v.u?`<a class="v-link" href="${esc(v.u)}" target="_blank" rel="noopener" title="${esc(v.u)}">${esc(v.t)}</a>`:esc(v.t))+`</span>`
+    +`<span class="v-steps">${vChips(v)}</span>`
+    +(v.s===3?`<span class="v-e" title="${esc(v.e)}">${esc(v.e||"")}</span>`:"")
+    +`<span class="v-r ${S_CLS[v.s]||""}">${S_NAME[v.s]||"-"}</span></div>`;
+}
+
+function renderVList(vids){
+  const f=$("#vFilter").value;
+  let arr=f==="run"?vids.filter(v=>v.s<=1):f==="done"?vids.filter(v=>v.s===2)
+        :f==="fail"?vids.filter(v=>v.s===3||v.s===4):vids.slice();
+  arr.sort((a,b)=>a.i-b.i); // 永远按视频编号固定排序, 正在下载的只高亮不挪位置
+  const CAP=300;
+  if(!arr.length){$("#vlist").innerHTML='<div class="vrow" style="border:0;color:var(--mut)">（无）</div>';return;}
+  let html=arr.slice(0,CAP).map(vRow).join("");
+  if(arr.length>CAP) html+=`<div class="vrow" style="border:0;color:var(--mut)">…共 ${arr.length} 条，仅显示前 ${CAP} 条，可切换筛选查看</div>`;
+  $("#vlist").innerHTML=html;
+}
+
+function renderVideos(j){
+  const vids=j.videos||[];
+  if(!vids.length){
+    if(lastVseq!==-1){lastVseq=-1;$("#vlist").innerHTML='<div class="vrow" style="border:0;color:var(--mut)">等待列表解析…</div>';}
+    return;
+  }
+  const vs=j.vseq||0;
+  if(vs!==lastVseq||lastFilter!==$("#vFilter").value){
+    lastVseq=vs; lastFilter=$("#vFilter").value;
+    renderVList(vids);
+  }else{
+    vids.forEach(v=>{
+      if(v.s!==1) return;
+      const el=document.getElementById("vr-"+v.i);
+      if(!el) return;
+      const c=el.querySelectorAll(".vs")[2];
+      if(c&&v.sn) c.textContent=`分片 ${v.sd||0}/${v.sn}`;
+    });
+  }
+}
+
+function saveCfg(){const o={};SAVED.forEach(id=>{if($("#"+id))o[id]=$("#"+id).value;});localStorage.setItem("ys_cfg",JSON.stringify(o));}
+function loadCfg(){try{const o=JSON.parse(localStorage.getItem("ys_cfg")||"{}");for(const k in o)if($("#"+k))$("#"+k).value=o[k];}catch(e){}}
+
+function render(j){
+  const pill=$("#pill");
+  if(j.empty){
+    running=false;
+    pill.textContent="空闲"; pill.className="pill";
+    $("#btnRun").textContent="▶ 运行流水线"; $("#btnRun").className="primary"; $("#btnRun").disabled=false;
+    $("#jobCfg").style.display="none";
+    if(!emptyState){  // 只清一次; 否则每次轮询都会把日志/队列重置
+      emptyState=true;
+      lastVseq=-1; lastFilter="all"; lastLogSeq=0;
+      $("#log").textContent="";
+      $("#vlist").innerHTML='<div class="vrow" style="border:0;color:var(--mut)">等待任务…</div>';
+      $("#metaRow").textContent="等待任务…";
+      $("#pct").textContent="0%"; $("#bar").style.width="0%";
+      $("#listStat").textContent="";
+      $("#btnRetry").style.display="none";
+    }
+    return;
+  }
+  emptyState=false;
+  running = !!j.running;
+  const st=j.stages;
+  $("#pct").textContent = Math.round(j.percent||0)+"%";
+  $("#bar").style.width = (j.percent||0)+"%";
+  const el=(j.t1||Date.now()/1000)-j.t0;
+  const speed = el>0 ? (st.out.gb*1024/el) : 0;
+  // 这里写的是 textContent, 不要再 esc —— 否则错误信息里的 & 会被显示成 &amp;
+  $("#metaRow").textContent =
+    `耗时 ${fmtT(el)} · 速度 ${speed.toFixed(1)} MB/s · 成功 ${st.dec.ok} · 失败 ${st.dec.fail||0} · 跳过 ${st.seg.skip||0} · 产出 ${st.out.count} 个 / ${(st.out.gb||0).toFixed(2)} GB` +
+    (j.error ? " · "+String(j.error).split("\n")[0] : "");
+  pill.textContent = j.error?"出错":j.running?"运行中":j.stopped?"已停止":"已完成";
+  pill.className = "pill "+(j.error?"err":j.running?"run":j.stopped?"stop":"ok");
+
+  const c=j.config;
+  // 任务摘要显示在顶部 jobCfg 行, 配置输入框常驻可改
+  $("#jobCfg").style.display="";
+  $("#jobCfg").textContent =
+    `本次任务: ${c.list_url} · 页 ${c.pages} · 并发 ${c.workers} · 分片 ${c.seg_concurrency} · 输出 ${c.outdir}` +
+    (j.error ? " · 可修改配置后重新运行" : (j.running ? "" : " · 可修改配置后再次运行"));
+  // 播放页/密钥/分片/合成 都是每部视频自己的步骤, 在「视频队列」逐行展示
+  // 列表解析进度显示在队列标题右侧
+  const ls=$("#listStat");
+  if(ls) ls.textContent = st.list.status==="idle" ? "" :
+    `已解析 ${st.list.pages}/${st.list.pages_total} 页 · 共 ${st.list.found} 个视频` +
+    (st.list.status==="running" ? " · 解析中…" : "");
+  renderVideos(j);
+
+  const pre=$("#log");
+  if(j.log){
+    const seq=j.log_seq||0;
+    if(seq<lastLogSeq){ pre.textContent=""; lastLogSeq=0; }  // 新任务：序号归零
+    if(seq>lastLogSeq){
+      // log 数组最多保留 400 行，但 log_seq 一直增长；只追加真正的新行
+      const newN=Math.min(seq-lastLogSeq,j.log.length);
+      const add=j.log.slice(j.log.length-newN).join("\n");
+      let txt=pre.textContent+(pre.textContent&&!pre.textContent.endsWith("\n")?"\n":"")+add;
+      const lines=txt.split("\n");
+      if(lines.length>MAX_LOG_LINES) txt=lines.slice(-MAX_LOG_LINES).join("\n");
+      pre.textContent=txt;
+      lastLogSeq=seq;
+      if($("#autoScroll").checked) pre.scrollTop=pre.scrollHeight;
+    }
+  }
+  const rb=$("#btnRun");
+  if(running){rb.textContent="⏹ 停止流水线";rb.className="danger";}
+  else{rb.textContent="▶ 运行流水线";rb.className="primary";}
+  rb.disabled=false;
+  // 运行中只数失败项; 结束后连「没来得及处理」(s=0)也算, 因为后端重试接口会一起重派
+  const fails=(j.videos||[]).filter(v=>v.s===3).length;
+  const pending=(j.videos||[]).filter(v=>v.s===0).length;
+  const retryable = running ? fails : fails+pending;
+  $("#retryN").textContent=retryable;
+  $("#btnRetry").style.display=retryable?"":"none";
+  $("#btnRetry").disabled=running;
+  FIELDS.forEach(id=>$("#"+id).disabled=running);
+}
+
+async function api(p,b){
+  try{
+    const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});
+    return await r.json();
+  }catch(e){return {ok:false,error:"请求失败: "+e};}
+}
+
+function toast(msg,err){
+  const t=$("#toast"); t.textContent=msg;
+  t.className="show"+(err?" err":"");
+  clearTimeout(t._h); t._h=setTimeout(()=>t.className="",3500);
+}
+
+let tickTimer=0, tickBusy=false, es=null, esActive=false;
+function scheduleTick(){
+  clearTimeout(tickTimer);
+  // 运行中快一点, 空闲时降频, 页面在后台时进一步降频, 别空转浪费电量
+  const delay = document.hidden ? 8000 : (running ? 1200 : 3000);
+  tickTimer=setTimeout(tick,delay);
+}
+function connectEvents(){
+  // 有 SSE 就不轮询；端点不可用/断开时自动退回 tick 轮询
+  if(!window.EventSource || es) return;
+  try{ es=new EventSource("/api/events"); }
+  catch(e){ return; }
+  es.onopen=()=>{ esActive=true; };
+  es.onmessage=e=>{ try{ render(JSON.parse(e.data)); }catch(_){} };
+  es.onerror=()=>{
+    esActive=false;
+    if(es){ es.close(); es=null; }
+    setTimeout(connectEvents,5000);
+  };
+}
+async function tick(){
+  clearTimeout(tickTimer);
+  if(tickBusy) return;
+  if(esActive){ scheduleTick(); return; }
+  tickBusy=true;
+  try{
+    const opt = self.AbortSignal && AbortSignal.timeout
+      ? {cache:"no-store", signal:AbortSignal.timeout(10000)}
+      : {cache:"no-store"};
+    const j=await (await fetch("/api/job",opt)).json();
+    render(j);
+  }catch(e){
+    const p=$("#pill"); p.textContent="服务未连接"; p.className="pill err";
+    $("#btnRun").disabled=true;
+  }finally{
+    tickBusy=false;
+    scheduleTick();
+  }
+}
+
+async function runPipeline(){
+  saveCfg();
+  const body={list_url:$("#f_url").value.trim(),
+    p1:+$("#f_p1").value,p2:+$("#f_p2").value,outdir:$("#f_out").value,
+    workers:+$("#f_workers").value,
+    seg_concurrency:+$("#f_segs").value};
+  const r=await api("/api/start",body);
+  if(!r.ok) return toast(r.error||"启动失败",true);
+  $("#log").textContent=""; lastLogSeq=0;
+  toast("流水线已启动");
+  setTimeout(tick,300);
+}
+async function stopPipeline(){
+  const r=await api("/api/stop",{});
+  if(!r.ok) toast(r.error||"",true); else toast("正在停止，等待当前分片收尾…");
+}
+$("#btnRun").onclick=async()=>{
+  if(running) return stopPipeline();
+  return runPipeline();
+};
+$("#btnRetry").onclick=async()=>{
+  const r=await api("/api/retry_failed",{});
+  if(!r.ok) return toast(r.error||"重试启动失败",true);
+  toast(`已重新派发 ${r.count} 个失败视频`);
+  setTimeout(tick,300);
+};
+
+loadCfg();
+document.addEventListener("visibilitychange",()=>{ if(!document.hidden) tick(); });
+connectEvents();
+tick();
+
+/* ---------------- 重复视频检测 (VDF 画面相似度查重) ----------------
+   整段包在独立 IIFE + try/catch 中, 且放在页面原有启动代码之后:
+   本面板任何异常都只影响自己, 不会打断上面的 loadCfg / setInterval(tick) / tick。 */
+(function dedupPanel(){
+  try{
+    const D = { st:null, ticks:0, busy:false, fetching:false, grpSig:"", fileSig:"", scrollIdx:-1 };
+
+    const numv = (sel, def) => { const n = parseFloat($(sel).value); return Number.isFinite(n) ? n : def; };
+    const dupBytes = n => {
+      n = +n || 0;
+      return n >= 1073741824 ? (n/1073741824).toFixed(2)+" GB"
+        : n >= 1048576 ? (n/1048576).toFixed(1)+" MB"
+        : (n/1024).toFixed(0)+" KB";
+    };
+    const tailLines = (s, n) => String(s||"").replace(/\r/g,"").split("\n").slice(-n).join("\n");
+    const clampPct = v => Math.max(0, Math.min(100, +v || 0));
+    // 下拉选项是 HTML 里写死的常量, 这里只用来把 key 翻回中文显示, 不再从后端取列表
+    function labelOf(sel, val){
+      if(!sel || !sel.options) return val || "";
+      for(const o of sel.options){ if(o.value === val) return o.textContent; }
+      return val || "";
+    }
+
+    function renderGroups(groups, showEmpty){
+      const box = $("#dupGroups");
+      groups = groups || [];
+      // 轻量指纹: 只拼组 id/文件数/保留标记/可释放空间。
+      // 之前对整组 JSON.stringify, 组多了每 2 秒都要序列化一遍(几百 KB), 纯属浪费。
+      const sig = groups.map(g => `${g.id}:${(g.items||[]).length}:${g.wasted}:`
+        + (g.items||[]).map(i => i.keep?1:0).join("")).join("|") + (showEmpty ? "|E" : "");
+      if(D.grpSig === sig) return;
+      D.grpSig = sig;
+      if(!groups.length){
+        box.innerHTML = showEmpty ? '<div class="help" style="padding:6px 2px">没有发现重复视频</div>' : "";
+        return;
+      }
+      box.innerHTML = groups.map((g, gi) => {
+        const items = g.items || [];
+        const rows = items.map(it => {
+          const flags = String(it.flags||"").split(",").filter(Boolean).map(f =>
+            `<i class="dup-tag">${esc(f === "AiMatched" ? "AI" : f === "PartialClip" ? "片段" : f)}</i>`).join("");
+          return `<div class="dup-row">`
+            + `<i class="dup-badge ${it.keep ? "keep" : "del"}">${it.keep ? "保留" : "删除"}</i>`
+            + `<span class="dup-name" title="${esc(it.path||"")}">${esc(it.name || it.path || "")}</span>`
+            + `<span class="dup-kv">${(+it.sim || 0).toFixed(1)}%</span>`
+            + (it.res ? `<span class="dup-kv">${esc(it.res)}</span>` : "")
+            + (it.kbps ? `<span class="dup-kv">${it.kbps} kbps</span>` : "")
+            + (it.dur ? `<span class="dup-kv">${esc(it.dur)}</span>` : "")
+            + flags
+            + `</div>`;
+        }).join("");
+        return `<div class="dup-grp"><div class="dup-grp-h">第 ${gi+1} 组 · ${items.length} 个文件 · 可释放 <span class="wasted">${dupBytes(g.wasted)}</span></div>${rows}</div>`;
+      }).join("");
+    }
+
+    function renderApply(j){
+      const info = $("#dupApplyInfo");
+      const out = $("#dupOut");
+      const la = j.last_apply;
+      if(!la){ info.textContent = ""; return; }
+      const sTxt = labelOf($("#dupStrategy"), la.strategy) || la.strategy || "";
+      const mTxt = labelOf($("#dupMode"), la.mode) || la.mode || "";
+      const t = la.at ? new Date(la.at*1000).toLocaleTimeString("zh-CN",{hour12:false}) : "";
+      const n = +la.deleted || 0;
+      info.textContent = `最近一次${la.mode === "dry-run" ? "预览" : "清理"}：${sTxt} · ${mTxt} · `
+        + `${la.mode === "dry-run" ? "将删除" : "已处理"} ${n} 个文件`
+        + (la.rc ? ` · 退出码 ${la.rc}` : "") + (t ? ` · ${t}` : "");
+      if(la.out && !out.textContent){
+        out.textContent = tailLines(la.out, 200);
+        out.style.display = "block";
+      }
+    }
+
+    // 去重列表: 「每个视频一行 + 关键步骤」, 按 VDF 真实流程展示
+    // 扫描(抽帧+感知哈希, 显示帧进度) -> 比对(最后一步, 统一推进)
+    // AI 匹配只是叠加在比对之上的另一路匹配, 不是每部视频的串行步骤, 所以放面板标题
+    function renderFiles(j){
+      const box = $("#dupFiles"), list = $("#dupFileList"), stat = $("#dupFilesStat");
+      box.style.display = j.running ? "block" : "none";
+      if(!j.running) return;
+      const files = j.files || [];
+      const total = j.file_total || files.length;
+      if(!files.length){
+        stat.textContent = "正在枚举视频文件…";
+        list.innerHTML = "";
+        D.fileSig = "";
+        return;
+      }
+      const cur = files.findIndex(f => f.s === 1);
+      const doneN = files.filter(f => f.s === 2).length;
+      const step = j.stage_cn
+        ? ` · 当前步骤：${j.stage_cn}` + (j.stage_max ? ` ${j.stage_cur}/${j.stage_max}` : "")
+        : "";
+      stat.textContent = `视频 ${files.length}${total > files.length ? "/" + total : ""} 个`
+        + ` · 已扫描 ${doneN}` + step;
+      // 只在状态/当前步骤变化时重建列表, 否则每 2 秒重排 500 行会抢占滚动条
+      const sig = files.map(f => `${f.s}${f.c || 0}${f.fc || 0}${f.fm || 0}`).join("") + cur;
+      if(D.fileSig === sig){ scrollToCur(cur); return; }
+      D.fileSig = sig;
+      const ch = (label, on, done) =>
+        `<span class="dstep${done ? " done" : on ? " on" : ""}">${label}</span>`;
+      list.innerHTML = files.map((f, i) => {
+        const cls = f.s === 1 ? " cur" : f.s === 2 ? " done" : "";
+        const c = f.c || 0;
+        const scan = f.fm ? `扫描 ${f.fc || 0}/${f.fm}` : "扫描";
+        return `<div class="dup-frow${cls}" data-i="${i}">`
+          + `<span class="dup-fname" title="${esc(f.p || f.n || "")}">${esc(f.n || f.p || "")}</span>`
+          + `<span class="dup-fsz">${dupBytes(f.sz)}</span>`
+          + ch(scan, f.s === 1, f.s === 2)
+          + ch("比对", c === 1, c === 2)
+          + `</div>`;
+      }).join("");
+      scrollToCur(cur);
+    }
+
+    function scrollToCur(cur){
+      if(cur < 0 || cur === D.scrollIdx) return;
+      const box = $("#dupFileList");
+      const el = box && box.querySelector(`.dup-frow[data-i="${cur}"]`);
+      if(!el) return;
+      D.scrollIdx = cur;
+      box.scrollTop = Math.max(0, el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2);
+    }
+
+    function renderStatus(j){
+      D.st = j;
+
+      const avail = j.available !== false;  // 状态未知时不误报警告条
+      const scanning = !!j.running || j.stage === "scanning";
+      // 结果面板默认收起: 没扫描过时整块都是空的, 白占屏幕
+      const hasResult = !!(j.groups && j.groups.length) || !!j.last_apply || !!j.error;
+      $("#dupPanel").style.display =
+        (scanning || hasResult || j.available === false) ? "" : "none";
+      $("#dupWarn").style.display = j.available === false ? "block" : "none";
+      const sb=$("#dupScan");
+      sb.disabled = !avail;
+      if(scanning){sb.textContent="⏹ 停止扫描";sb.className="danger";}
+      else{sb.textContent="🔍 扫描重复视频";sb.className="primary";}
+      $("#dupApply").disabled = scanning || D.busy || !(j.groups && j.groups.length);
+      $("#dupStat").textContent = scanning ? "扫描中…"
+        : j.stage === "done" ? "扫描完成"
+        : j.stage === "error" ? "扫描出错" : "";
+      const aiEl = $("#dupAi");
+      aiEl.textContent = `AI 匹配：${j.ai ? "开" : "关"}`;
+      aiEl.className = "dup-ai" + (j.ai ? "" : " off");
+
+      $("#dupProgress").style.display = scanning ? "block" : "none";
+      $("#dupBar").style.width = clampPct(j.percent) + "%";
+      $("#dupPctTxt").textContent = Math.round(clampPct(j.percent)) + "%";
+      const cur = $("#dupCur");
+      cur.textContent = j.current || "";
+      cur.title = j.current || "";
+      $("#dupEla").textContent = fmtT(+j.elapsed || 0);
+      renderFiles(j);
+
+      const errEl = $("#dupErr");
+      errEl.style.display = j.error ? "block" : "none";
+      errEl.textContent = j.error ? "出错：" + j.error : "";
+
+      const sum = $("#dupSummary");
+      let sumTxt = "";
+      if(scanning){
+        sumTxt = "正在扫描" + (j.dir ? " " + j.dir : "") + "…";
+      }else if(j.stage === "done"){
+        sumTxt = (j.groups && j.groups.length)
+          ? `共 ${j.dup_groups || 0} 组重复 · ${j.dup_files || 0} 个文件 · 可释放 ${dupBytes(j.wasted)}`
+          : "没有发现重复视频";
+      }else if(j.stage === "error"){
+        sumTxt = "扫描失败，可调整参数后重试";
+      }else if(j.groups && j.groups.length){
+        sumTxt = `上次扫描结果：共 ${j.dup_groups || 0} 组重复 · ${j.dup_files || 0} 个文件 · 可释放 ${dupBytes(j.wasted)}`;
+      }
+      sum.textContent = sumTxt;
+      sum.style.display = sumTxt ? "block" : "none";
+
+      renderGroups(j.groups || [], j.stage === "done");
+      renderApply(j);
+    }
+
+    // 状态拿不到时把原因显示出来, 否则面板会是一片空白, 看不出是"没扫描"还是"接口没有"
+    function showOffline(msg){
+      // 面板默认是收起的, 报错时必须展开, 否则这条提示用户根本看不到
+      $("#dupPanel").style.display = "";
+      const el = $("#dupErr");
+      el.style.display = "block";
+      el.textContent = msg;
+    }
+
+    async function refresh(){
+      if(D.fetching) return;   // 上一个请求还没回来就不再叠一个
+      D.fetching = true;
+      try{
+        const opt = self.AbortSignal && AbortSignal.timeout
+          ? {cache:"no-store", signal:AbortSignal.timeout(10000)}
+          : {cache:"no-store"};
+        const r = await fetch("/api/dedup/status", opt);
+        if(!r.ok) throw new Error("HTTP " + r.status);
+        renderStatus(await r.json());
+      }catch(e){
+        showOffline("查重服务不可用（/api/dedup/status 请求失败：" + e +
+                    "）。如果刚更新过代码，请重启后端服务。");
+      }finally{
+        D.fetching = false;
+      }
+    }
+
+    function poll(){
+      if(document.hidden) return;   // 后台标签页不做无意义轮询
+      D.ticks++;
+      const scanning = D.st && (D.st.running || D.st.stage === "scanning");
+      // 扫描中每 2 秒拉一次; 空闲时降频到每 10 秒一次
+      if(scanning || D.ticks % 5 === 0) refresh();
+    }
+
+    async function startScan(){
+      if(D.st && D.st.available === false){
+        toast("未找到 vdf 命令，请先安装 videoduplicatefinder CLI", true);
+        return;
+      }
+      const body = {
+        // 扫描目录不再单独维护, 直接跟随上方「输出目录」, 避免两处填写不一致
+        dir: $("#f_out").value.trim(),
+        percent: numv("#dupPct", 96)
+      };
+      try{
+        D.fileSig = ""; D.scrollIdx = -1;
+        const r = await api("/api/dedup/start", body);
+        if(!r.ok){
+          toast(r.error || "启动扫描失败", true);
+          if(D.st) renderStatus(D.st);
+          return;
+        }
+        $("#dupOut").textContent = ""; $("#dupOut").style.display = "none";
+        $("#dupApplyInfo").textContent = "";
+        D.grpSig = "";
+        renderStatus(Object.assign({}, D.st || {}, {
+          running: true, stage: "scanning", percent: 0, current: "", elapsed: 0,
+          error: "", groups: [], dup_groups: 0, dup_files: 0, wasted: 0
+        }));
+        toast("已开始扫描重复视频");
+        setTimeout(refresh, 500);
+      }catch(e){
+        toast("启动扫描失败: " + e, true);
+        if(D.st) renderStatus(D.st);
+      }
+    }
+
+    async function stopScan(){
+      try{
+        const r = await api("/api/dedup/stop", {});
+        if(!r.ok){ toast(r.error || "停止失败", true); return; }
+        toast("正在停止扫描…");
+        setTimeout(refresh, 600);
+      }catch(e){ toast("停止失败: " + e, true); }
+    }
+
+    async function applyCleanup(){
+      if(D.busy) return;
+      const strategy = $("#dupStrategy").value;
+      const mode = $("#dupMode").value;
+      if(!strategy || !mode) return toast("请先选择清理策略和模式", true);
+      const selS = $("#dupStrategy"), selM = $("#dupMode");
+      const sTxt = selS.selectedOptions[0] ? selS.selectedOptions[0].textContent : strategy;
+      const mTxt = selM.selectedOptions[0] ? selM.selectedOptions[0].textContent : mode;
+      if(mode !== "dry-run"){
+        if(!confirm(`确认清理重复视频？\n\n策略：${sTxt}\n模式：${mTxt}\n\n非预览模式会按 VDF 结果处理重复文件，请确认策略无误。`)) return;
+      }
+      D.busy = true;
+      $("#dupApply").disabled = true;
+      try{
+        const r = await api("/api/dedup/apply", { strategy, mode });
+        const out = $("#dupOut");
+        if(r && r.out){
+          out.textContent = tailLines(r.out, 300);
+          out.style.display = "block";
+        }
+        if(!r || !r.ok){
+          toast((r && r.error) || "清理失败", true);
+        }else{
+          toast(mode === "dry-run" ? `预览完成：将删除 ${r.deleted || 0} 个文件`
+                                   : `清理完成：已处理 ${r.deleted || 0} 个文件`);
+        }
+        await refresh();
+      }catch(e){
+        toast("清理失败: " + e, true);
+      }finally{
+        D.busy = false;
+        if(D.st) renderStatus(D.st);
+      }
+    }
+
+    function init(){
+      // 扫描目录不再单独维护, 直接跟随上方「输出目录」(见 startScan)
+      $("#dupScan").onclick = function(){
+        const scanning = D.st && (D.st.running || D.st.stage === "scanning");
+        if(scanning) stopScan(); else startScan();
+      };
+      $("#dupApply").onclick = applyCleanup;
+      refresh();
+      setInterval(poll, 2000);
+    }
+    init();
+  }catch(e){
+    console.error("[dedup] 面板初始化失败:", e);
+  }
+})();
+</script>
+</body>
+</html>

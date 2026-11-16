@@ -1,0 +1,140 @@
+# 流水线 / 解析器 / 浏览器 / 重试 相关规则（与站点无关，可热更）
+# 说明: 这里放的都是「正则片段」或「阈值/关键词列表」，运行期由 RuleManager 编译成
+# 组合正则缓存起来使用。换站点一般改 link_rules.yaml 或直接新增插件，不动本文件。
+
+pipeline:
+  # 连续这么多视频失败就熔断中止任务（成功一次即清零）
+  streak_limit: 5
+  # 分片下载并发现在由界面配置（1-24，默认 8），不再走规则文件
+  # 任务运行中域名失效时自动重探的冷却时间(秒)，多个视频同时失败只探一次。
+  # 分片连续失败时允许绕过该冷却做一次强制重探（仍限制 5 秒一次，避免并发风暴）。
+  reprobe_cooldown: 300
+  # 输出目录所在磁盘剩余低于该 GB 数时直接中止任务(读不到容量按 0 处理)
+  disk_min_gb: 5
+  # 列表页并发抓取/解析的页数(1-6)。结果仍按页码顺序入队, 视频编号不会乱。
+  list_concurrency: 3
+  # 这些错误重试没有意义（站点结构变了/文件不存在/磁盘满/合并失败），直接判失败
+  non_retryable:
+    - "未能自动提取 m3u8"
+    - "未发出 m3u8"
+    - "no segments"
+    - "404"
+    - "Not Found"
+    - "DISK FULL"
+    - "ffmpeg rc="
+    - "ffmpeg 合成"
+    - "empty master m3u8"
+    - "多码率嵌套过深"
+    - "密钥轮换"
+    - "密钥长度异常"
+    - "IV 长度异常"
+    - "不支持的加密方式"
+    - "不支持的密钥格式"
+    - "密钥标签缺少 URI"
+    # fMP4(#EXT-X-MAP) 属于链路能力缺口，重试没有意义
+    - "fMP4"
+    - "EXT-X-MAP"
+    - "不是 TS 流"
+  # 发布页/换域名提示页上的按钮文字（按顺序尝试，命中即点）
+  publish_click_texts:
+    - "進入"
+    - "进入"
+    - "继续访问"
+    - "点击进入"
+    - "新域名"
+  # 从页面文字里识别新域名（正则必须有一个分组是域名）
+  # 只在页面本身带发布页/换域名提示时使用，避免把普通文章里的链接误判成新站。
+  new_domain_patterns:
+    - "(?:新域名|最新域名|永久域名|最新地址|永久地址|访问地址|备用地址|新地址)[：:\\s]*(?:https?://)?([a-z0-9.-]+\\.[a-z]{2,})"
+    - "(?:请访问|请使用|请收藏|请更换为|更换为|改为)[：:\\s]*(?:https?://)?([a-z0-9.-]+\\.[a-z]{2,})"
+  # 页面里出现这些字样，说明拿到的是「发布页/壳站」，才值得启动浏览器找真站入口
+  shell_hints:
+    - "发布页"
+    - "發布頁"
+    - "發布"
+    - "进入"
+    - "進入"
+    - "永久域名"
+    - "永久地址"
+    - "最新网址"
+    - "最新地址"
+    - "新域名"
+    - "最新域名"
+    - "新地址"
+    - "备用地址"
+    - "收藏本站"
+    - "跳转"
+  # 页面里自动跳转信号(meta refresh / JS location)。命中就值得让浏览器跟一下
+  redirect_hint: >-
+    http-equiv\s*=\s*["']?refresh|location\s*\.\s*(?:href|replace|assign)
+    |window\.location|top\.location
+
+resolver:
+  # 播放页里 m3u8 地址的兜底正则(整段 URL)
+  m3u8_pattern: '(?:https?:)?//[^\s"''<>\\]+?\.m3u8[^\s"''<>\\]*'
+  # maccms 系加密密钥写在 <meta name="..."> 里，候选 name
+  crypt_key_names:
+    - "crypt_key"
+    - "encryption_key"
+  # 加密 blob 常见形态：aesDecrypt(...) 里的长密文
+  aes_call_pattern: 'aesDecrypt\w*\(\s*["'']([A-Za-z0-9+/=_-]{40,})["'']'
+  # 兜底大块 base64 密文
+  blob_pattern: '["'']([A-Za-z0-9+/=_-]{200,})["'']'
+  # 解密后 JSON 里的视频名字段
+  vod_name_pattern: '"vod_name"\s*:\s*"([^"]+)"'
+
+browser:
+  # 浏览器兜底: 主动触发播放时点击的选择器(逐个尝试，命中即点)
+  trigger_selectors:
+    - ".vjs-big-play-button"
+    - ".dplayer-play-icon"
+    - ".dplayer-video-wrap"
+    - ".artplayer-plugin"
+    - ".xgplayer-start"
+    - ".player-cover"
+    - ".cover"
+    - ".play-btn"
+    - ".playbtn"
+    - ".btn-play"
+    - "[class*=\"play-icon\"]"
+    - "[class*=\"play-icon\"] *"
+    - "[class*=\"player\"] [class*=\"play\"]"
+    - "#player"
+    - ".video-play"
+    - ".play"
+  # 浏览器标题候选: 常见的标题 class 选择器
+  title_selectors:
+    - ".rank-title"
+    - ".vod-title"
+    - ".video-title"
+    - ".play-title"
+    - ".detail-title"
+    - ".movie-title"
+    - "[itemprop=\"name\"]"
+  # 浏览器列表页: 卡片标题 class 子元素选择器
+  card_title_selector: "[class*=title]"
+  # 无 href 的 SPA 卡片: 列表页卡片只绑 JS 路由、DOM 里没有链接,
+  # 浏览器兜底会逐个点击取详情页地址(只在这些选择器命中时启用, 数量受 card_click_max 限制)
+  card_selectors:
+    - ".video-card"
+    - ".vod-item"
+    - ".video-item"
+    - "[class*=video-card]"
+    - "[class*=vod-item]"
+  card_click_max: 40
+  # SPA 翻页: 部分站点(如 zd3xy)会剥掉 URL 里的 page 参数, 永远显示第 1 页,
+  # 必须在页面内点「下一页」按钮翻页。这里给按钮选择器, 找不到时退化为只读当前页。
+  next_page_selector: ".pg-btn, .load-more button, .pagination .nav:last-child, .next-page, [class*=next]"
+  # 翻页按钮文本候选(按顺序尝试, 命中即点): zd3xy 用「下一页」, enw 用「加载更多」
+  next_page_texts:
+    - "下一页"
+    - "加载更多"
+    - "更多"
+    - "Load More"
+  # 加密 SPA(如 zd3xy): 列表数据来自加密 API(libsodium secretbox), DOM 拿不到明文。
+  # 开启后用 TextDecoder 钩子拦截浏览器解密后的 JSON, 再点「下一页」翻页。
+  # 仅在静态解析失败且 detail_url_template 非空时启用, 不影响普通站点。
+  use_api_capture: true
+  # 详情页 URL 模板, 用视频 id 填充, 如 "/video/play?id={id}"。
+  # 非空时 API 捕获模式直接用它拼详情页地址, 免去逐个点击卡片取链接。
+  detail_url_template: "/video/play?id={id}"

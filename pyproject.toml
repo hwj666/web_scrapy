@@ -1,0 +1,46 @@
+[project]
+name = "ys-web"
+version = "0.1.0"
+description = "HLS 视频下载工具"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "pycryptodome",
+    "imageio-ffmpeg",
+    "playwright==1.65.2",
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pyyaml",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["downloads", ".venv", "__pycache__"]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.ruff.lint]
+# 先收紧到"高信号、低噪音"的规则集，存量代码可以零告警通过；后续再逐步加 S/SIM 等
+select = ["E", "F", "W", "I", "UP", "B"]
+# UP031：browser_*.py 里的 JS 模板大量使用 {} ，保留 % 格式化比堆 f-string 转义更可读
+ignore = ["E501", "UP031"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+files = ["app", "main.py"]
+# 存量代码还没全量类型化，先只要求"新增代码不引入更糟的问题"
+warn_unused_ignores = false
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/_*"]

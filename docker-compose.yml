@@ -1,0 +1,39 @@
+# 固定项目名: 卷名/容器网络都以此为前缀(如 ys_web_venv)
+# 不写则默认取所在目录名, 换目录会创建新卷; 写死后换目录也能复用原来的卷
+name: ys_web
+
+services:
+  ys_web:
+    image: ys_web:base
+    container_name: ys_web
+    ports:
+      - "8765:8765"
+    working_dir: /ys_web
+    environment:
+      - TZ=Asia/Shanghai
+      # 与下方卷挂载点一一对应, 改路径两边一起改
+      - UV_PROJECT_ENVIRONMENT=/opt/venv   # Python 依赖安装位置 → venv 卷
+      - UV_CACHE_DIR=/uv-cache             # 包下载缓存位置 → uv-cache 卷
+      - OUTDIR=/downloads                  # 视频输出目录 → downloads 绑定挂载
+      # VDF 用它判断"是否在容器里", 决定把状态目录放哪。
+      # 不设的话 vdf 会用自身安装目录(/opt/vdf/outputCLI)存状态。
+      - DOTNET_RUNNING_IN_CONTAINER=true
+      # 状态目录重定向到镜像内路径: 查重用的 AI 组件已烘焙在那里(见 Dockerfile),
+      # 运行时只读不写, 所以不需要挂卷, 容器重建也不会丢。
+      - XDG_STATE_HOME=/opt/vdf-state
+    volumes:
+      # 代码挂载: 改代码即时生效, 配合 --reload 热重载
+      - .:/ys_web
+      # 命名卷: Python 依赖和下载缓存持久化, 容器删了不用重装
+      - venv:/opt/venv
+      - uv-cache:/uv-cache
+      # 下载输出目录（映射到宿主机，容器销毁不丢失）
+      - ./downloads:/downloads
+    # 启动时: 增量同步依赖(有变化才装) → 热重载启动
+    # 加/改依赖后 docker compose restart 即可; 浏览器用镜像里预装的 Playwright chromium
+    command: sh -c "uv sync --no-dev && uv run uvicorn main:app --host 0.0.0.0 --port 8765 --reload"
+    restart: unless-stopped
+
+volumes:
+  venv:
+  uv-cache:

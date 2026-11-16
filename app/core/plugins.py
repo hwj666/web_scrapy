@@ -1,0 +1,54 @@
+"""插件基类：列表 / 播放页解析器接口 + 运行期上下文。
+
+解析器在 `Job._ensure_plugins()` 里显式实例化（内置四种：静态列表 / 浏览器列表 /
+静态播放页 / 浏览器播放页）。需要适配新站点时，在 `app/plugins/` 下新增一个类，
+并在 `Job._ensure_plugins()` 里登记即可，没有运行期自动发现。
+
+接口全部是 async：取数走同一个 asyncio 事件循环，不再为每线程建 Session。
+"""
+from __future__ import annotations
+
+import abc
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from .models import ListPage, ResolvedVideo, VideoItem
+
+
+@dataclass
+class PluginContext:
+    """插件运行时的上下文：取数回调 + 配置 + 共享状态（规则等）。"""
+    fetch: Callable[..., Awaitable[Any]]
+    cfg: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict)
+
+
+class ListParserPlugin(abc.ABC):
+    """列表页解析插件接口。"""
+    name = "list"
+    uses_browser = False  # 需要无头浏览器页面对象的插件置 True
+
+    def __init__(self, ctx: PluginContext | None = None) -> None:
+        self.ctx = ctx or PluginContext(_noop_fetch)
+
+    @abc.abstractmethod
+    async def parse(self, html: str, page: int, base: str) -> ListPage:
+        ...
+
+
+class ResolverPlugin(abc.ABC):
+    """播放页解析插件接口。"""
+    name = "resolver"
+    uses_browser = False
+
+    def __init__(self, ctx: PluginContext | None = None) -> None:
+        self.ctx = ctx or PluginContext(_noop_fetch)
+
+    @abc.abstractmethod
+    async def resolve(self, item: VideoItem, base: str) -> ResolvedVideo:
+        ...
+
+
+async def _noop_fetch(*_a: Any, **_k: Any) -> None:
+    return None

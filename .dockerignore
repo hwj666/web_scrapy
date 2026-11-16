@@ -1,0 +1,16 @@
+# 构建上下文必须瘦身：downloads/ 是运行产物（实测可达数 GB），不该发给 docker daemon
+downloads/
+.git/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+app/*.log
+*.log
+tests/
+.github/
+REFACTOR.md
+OPTIMIZATION.md
