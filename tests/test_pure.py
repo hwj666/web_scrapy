@@ -1,4 +1,5 @@
 """纯函数单测：m3u8 解析、密钥计划、URL 与编解码工具（不依赖网络/第三方库）。"""
+
 from __future__ import annotations
 
 import unittest
@@ -15,7 +16,13 @@ from app.toolkit.m3u8 import (
     media_lines,
     media_sequence,
 )
-from app.toolkit.url import abs_url, auto_list_url, split_urls
+from app.toolkit.url import (
+    abs_url,
+    auto_list_url,
+    page_mode_warning,
+    page_url,
+    split_urls,
+)
 
 
 class M3u8Tests(unittest.TestCase):
@@ -30,7 +37,7 @@ class M3u8Tests(unittest.TestCase):
     def test_key_schedule_derives_iv_from_sequence(self) -> None:
         text = (
             "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:7\n"
-            "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
             "#EXTINF:4,\na.ts\n#EXTINF:4,\nb.ts\n"
         )
         slots = key_schedule(text)
@@ -42,9 +49,9 @@ class M3u8Tests(unittest.TestCase):
     def test_key_schedule_supports_rotation_and_clear(self) -> None:
         text = (
             "#EXTM3U\n"
-            "#EXT-X-KEY:METHOD=AES-128,URI=\"k1\",IV=0x00000000000000000000000000000001\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="k1",IV=0x00000000000000000000000000000001\n'
             "a.ts\n"
-            "#EXT-X-KEY:METHOD=AES-128,URI=\"k2\",IV=0x00000000000000000000000000000002\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="k2",IV=0x00000000000000000000000000000002\n'
             "b.ts\n"
             "#EXT-X-KEY:METHOD=NONE\n"
             "c.ts\n"
@@ -57,21 +64,23 @@ class M3u8Tests(unittest.TestCase):
 
     def test_key_schedule_rejects_unsupported_method(self) -> None:
         with self.assertRaises(ValueError):
-            key_schedule("#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"k\"\nseg.ts\n")
+            key_schedule('#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="k"\nseg.ts\n')
 
     def test_key_schedule_rejects_bad_iv(self) -> None:
         with self.assertRaises(ValueError):
-            key_schedule("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\",IV=0x12\nseg.ts\n")
+            key_schedule('#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k",IV=0x12\nseg.ts\n')
 
     def test_key_schedule_rejects_drm_keyformat(self) -> None:
         with self.assertRaises(ValueError):
-            key_schedule("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\","
-                         "KEYFORMAT=\"com.apple.streamingkeydelivery\"\nseg.ts\n")
+            key_schedule(
+                '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k",'
+                'KEYFORMAT="com.apple.streamingkeydelivery"\nseg.ts\n'
+            )
 
     def test_key_info_still_detects_true_rotation(self) -> None:
         text = (
-            "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"a\"\nseg0.ts\n"
-            "#EXT-X-KEY:METHOD=AES-128,URI=\"b\"\nseg1.ts\n"
+            '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="a"\nseg0.ts\n'
+            '#EXT-X-KEY:METHOD=AES-128,URI="b"\nseg1.ts\n'
         )
         with self.assertRaises(ValueError):
             key_info(text)
@@ -79,11 +88,12 @@ class M3u8Tests(unittest.TestCase):
     def test_abs_segment_does_not_inherit_query_by_default(self) -> None:
         self.assertEqual(
             abs_segment("seg.ts", "https://cdn.example.com/a/index.m3u8?sign=x"),
-            "https://cdn.example.com/a/seg.ts")
+            "https://cdn.example.com/a/seg.ts",
+        )
         self.assertEqual(
-            abs_segment("//cdn.example.com/seg.ts",
-                        "https://cdn.example.com/a/index.m3u8"),
-            "https://cdn.example.com/seg.ts")
+            abs_segment("//cdn.example.com/seg.ts", "https://cdn.example.com/a/index.m3u8"),
+            "https://cdn.example.com/seg.ts",
+        )
 
     def test_master_playlist(self) -> None:
         text = (
@@ -94,8 +104,7 @@ class M3u8Tests(unittest.TestCase):
         self.assertEqual(best_variant(text), "high.m3u8")
 
     def test_fmp4_detection(self) -> None:
-        self.assertTrue(has_init_segment(
-            '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\nseg.m4s\n'))
+        self.assertTrue(has_init_segment('#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\nseg.m4s\n'))
         self.assertFalse(has_init_segment("#EXTM3U\nseg.ts\n"))
 
     def test_byterange_and_endlist_detection(self) -> None:
@@ -110,39 +119,57 @@ class UrlCodecTests(unittest.TestCase):
     def test_split_urls(self) -> None:
         self.assertEqual(
             split_urls("https://a.com/1, https://b.com/2；https://a.com/1"),
-            ["https://a.com/1", "https://b.com/2"])
+            ["https://a.com/1", "https://b.com/2"],
+        )
 
     def test_auto_list_url(self) -> None:
-        self.assertEqual(auto_list_url("https://x.com/list/3.html", 9),
-                         "https://x.com/list/9.html")
-        self.assertEqual(auto_list_url("https://x.com/list/{}", 9),
-                         "https://x.com/list/9")
-        self.assertEqual(auto_list_url("https://x.com/list/", 2),
-                         "https://x.com/list?page=2")
+        self.assertEqual(auto_list_url("https://x.com/list/3.html", 9), "https://x.com/list/9.html")
+        self.assertEqual(auto_list_url("https://x.com/list/{}", 9), "https://x.com/list/9")
+        self.assertEqual(auto_list_url("https://x.com/list/", 2), "https://x.com/list?page=2")
 
     def test_auto_list_url_keeps_query_and_fragment(self) -> None:
         # 路径里的数字才是页码，query 里的 id/普通参数不能被改
-        self.assertEqual(auto_list_url("https://x.com/list/3.html?x=1", 9),
-                         "https://x.com/list/9.html?x=1")
+        self.assertEqual(auto_list_url("https://x.com/list/3.html?x=1", 9), "https://x.com/list/9.html?x=1")
         # 已有 page 参数：改值而不是再拼一个
-        self.assertEqual(auto_list_url("https://x.com/list?page=1", 9),
-                         "https://x.com/list?page=9")
+        self.assertEqual(auto_list_url("https://x.com/list?page=1", 9), "https://x.com/list?page=9")
         # 普通 query：追加 page，用 & 连接
-        self.assertEqual(auto_list_url("https://x.com/list?foo=1", 9),
-                         "https://x.com/list?foo=1&page=9")
+        self.assertEqual(auto_list_url("https://x.com/list?foo=1", 9), "https://x.com/list?foo=1&page=9")
         # fragment 必须留在最后
-        self.assertEqual(auto_list_url("https://x.com/list#top", 9),
-                         "https://x.com/list?page=9#top")
+        self.assertEqual(auto_list_url("https://x.com/list#top", 9), "https://x.com/list?page=9#top")
 
     def test_abs_url(self) -> None:
         self.assertEqual(abs_url("/a/b", "https://x.com/c/d"), "https://x.com/a/b")
         self.assertEqual(abs_url("https://y.com/z", "https://x.com"), "https://y.com/z")
 
+    def test_query_page_wins_over_path_number(self) -> None:
+        # 路径里的 144 是分类 ID，query 里的 page 才是页码：不能把分类改成 1/2/3
+        self.assertEqual(
+            auto_list_url("https://x.com/vodtype/144.html?page=2", 3), "https://x.com/vodtype/144.html?page=3"
+        )
+        self.assertEqual(
+            auto_list_url("https://x.com/vodtype/144.html?page=2", 1), "https://x.com/vodtype/144.html?page=1"
+        )
+
+    def test_single_page_task_keeps_category_url(self) -> None:
+        # 单页任务（p1 == p2）原样使用用户粘贴的地址，避免把分类 ID 当页码
+        self.assertEqual(
+            page_url("https://x.com/vodtype/144.html", 1, 1, 1), "https://x.com/vodtype/144.html"
+        )
+        # 多页任务且无显式占位符时仍按旧的“路径最后一个数字是页码”推断
+        self.assertEqual(page_url("https://x.com/list/3.html", 2, 1, 5), "https://x.com/list/2.html")
+
+    def test_page_mode_warning(self) -> None:
+        self.assertEqual(page_mode_warning("https://x.com/vodtype/144.html?page={}", 1, 3), "")
+        self.assertEqual(page_mode_warning("https://x.com/vodtype/144.html?page=2", 1, 3), "")
+        warn = page_mode_warning("https://x.com/vodtype/144.html", 1, 3)
+        self.assertIn("分类", warn)
+        # 单页任务不需要翻页，也就不需要提示
+        self.assertEqual(page_mode_warning("https://x.com/vodtype/144.html", 1, 1), "")
+
     def test_decode_and_unpad(self) -> None:
         self.assertEqual(unpad_pkcs7(b"hello\x03\x03\x03"), b"hello")
         self.assertEqual(unpad_pkcs7(b"hello"), b"hello")
-        self.assertEqual(decode_body("中文".encode("gb18030"), "text/html; charset=gb18030"),
-                         "中文")
+        self.assertEqual(decode_body("中文".encode("gb18030"), "text/html; charset=gb18030"), "中文")
         page = 'document.write(decodeURIComponent("%3Cp%3Ehi%3C%2Fp%3E"))<script>x</script>'
         self.assertEqual(decode_page(page).strip(), "<p>hi</p>")
 

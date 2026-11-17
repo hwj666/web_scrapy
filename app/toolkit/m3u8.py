@@ -1,4 +1,5 @@
 """HLS/m3u8 工具：纯函数，不依赖网络或文件。"""
+
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -39,8 +40,7 @@ def has_endlist(text: str | None) -> bool:
 
 
 def media_lines(text: str | None) -> list[str]:
-    return [s for s in (ln.strip() for ln in (text or "").splitlines())
-            if s and not s.startswith("#")]
+    return [s for s in (ln.strip() for ln in (text or "").splitlines()) if s and not s.startswith("#")]
 
 
 def parse_attrs(tag: str) -> dict[str, str]:

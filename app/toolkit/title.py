@@ -4,6 +4,7 @@
 视频名的那一个，期间用站名/页面套话/纯数字过滤。所有「规则」都来自
 `app/rules/title_rules.yaml` 与 `link_rules.yaml`（title_block_keys）。
 """
+
 from __future__ import annotations
 
 import html as html_mod
@@ -16,8 +17,10 @@ _ATTR_RE = re.compile(r'([\w:-]+)\s*=\s*(["\'])(.*?)\2', re.S)
 _META_TAG_RE = re.compile(r"<meta\b[^>]*>", re.I)
 _TITLE_BLOCK_RE = re.compile(
     r"<(?P<tag>div|span|h1|h2|h3|h4|p|a|strong|em|li)\b(?P<attrs>[^>]*)>"
-    r"(?P<inner>.*?)</(?P=tag)\s*>", re.S | re.I)
-_LD_JSON_RE = re.compile(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', re.S | re.I)
+    r"(?P<inner>.*?)</(?P=tag)\s*>",
+    re.S | re.I,
+)
+_LD_JSON_RE = re.compile(r"<script[^>]+application/ld\+json[^>]*>(.*?)</script>", re.S | re.I)
 _TITLE_TAG_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.S | re.I)
 _H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.S | re.I)
 
@@ -73,7 +76,7 @@ class TitleCleaner:
         site_names = [self.clean(x) for x in site_names if x]
         sep_re = self._cache.get("sep_re")
         cleaned: list[str] = []
-        for seg in (sep_re.split(raw) if sep_re else [raw]):
+        for seg in sep_re.split(raw) if sep_re else [raw]:
             seg = self._strip_known_site(self.clean(seg), site_names)
             if seg and not self.is_generic(seg):
                 cleaned.append(seg)
@@ -81,8 +84,7 @@ class TitleCleaner:
             return ""
         ep_re = self._cache.get("episode_re")
         named = [s for s in cleaned if not (ep_re and ep_re.match(s))] or cleaned
-        if (len(named) > 1 and self.looks_like_site(named[0])
-                and not self.looks_like_site(named[-1])):
+        if len(named) > 1 and self.looks_like_site(named[0]) and not self.looks_like_site(named[-1]):
             return max(named[1:], key=len)
         return named[0]
 
@@ -128,9 +130,11 @@ def page_title(html: str, cleaner: TitleCleaner, title_block_keys: Iterable[str]
     t_clean = cleaner.clean(title_tag)
     # 没有分隔符的 <title> 可能是站名，也可能是不带站名后缀的视频名：
     # 只有像站名（含影院/影视/在线…）或与 og:site_name 相同时才当站名挡掉。
-    if (t_clean and not cleaner.has_separator(title_tag)
-            and (cleaner.looks_like_site(t_clean)
-                 or any(t_clean == str(x).strip() for x in site))):
+    if (
+        t_clean
+        and not cleaner.has_separator(title_tag)
+        and (cleaner.looks_like_site(t_clean) or any(t_clean == str(x).strip() for x in site))
+    ):
         site.append(title_tag)
 
     keys = tuple(k.lower() for k in title_block_keys)

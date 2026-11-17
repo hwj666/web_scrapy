@@ -3,6 +3,7 @@
 运行期由 `RuleManager` 一次性加载并编译，解析器与 Job 通过它取得已编译规则，
 不再各自硬编码。新增/调整规则只改 YAML，不改代码；新站点则写一个新解析器文件。
 """
+
 from __future__ import annotations
 
 import os
@@ -28,6 +29,7 @@ def _one(pattern: str | None, flags: int = 0) -> re.Pattern[str] | None:
 @dataclass
 class TitleRules:
     """标题清洗规则（title_rules.yaml → title）。"""
+
     separators: list[str] = field(default_factory=list)
     prefix_patterns: list[str] = field(default_factory=list)
     suffix_patterns: list[str] = field(default_factory=list)
@@ -52,6 +54,7 @@ class TitleRules:
 @dataclass
 class LinkRules:
     """列表页链接规则（link_rules.yaml → link）。"""
+
     exclude_re: re.Pattern[str] | None = None
     ext_re: re.Pattern[str] | None = None
     ad_re: re.Pattern[str] | None = None
@@ -64,6 +67,7 @@ class LinkRules:
 @dataclass
 class ResolverRules:
     """播放页解析规则（pipeline_rules.yaml → resolver）。"""
+
     m3u8_re: re.Pattern[str] | None = None
     crypt_key_re: re.Pattern[str] | None = None
     aes_call_re: re.Pattern[str] | None = None
@@ -74,6 +78,7 @@ class ResolverRules:
 @dataclass
 class PipelineRules:
     """流水线阈值与非重试/发布页/跳转信号（pipeline_rules.yaml → pipeline）。"""
+
     streak_limit: int = 5
     reprobe_cooldown: int = 300
     disk_min_gb: int = 5
@@ -93,6 +98,7 @@ class PipelineRules:
 @dataclass
 class BrowserRules:
     """浏览器兜底规则（pipeline_rules.yaml → browser）。"""
+
     trigger_selectors: list[str] = field(default_factory=list)
     title_selectors: list[str] = field(default_factory=list)
     card_title_selector: str = "[class*=title]"
@@ -115,7 +121,8 @@ class RuleManager:
 
     def __init__(self, rule_dir: str | None = None) -> None:
         self.rule_dir = rule_dir or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rules")
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rules"
+        )
         self.title = TitleRules()
         self.link = LinkRules()
         self.resolver = ResolverRules()
@@ -169,8 +176,8 @@ class RuleManager:
             shell_hints=tuple(p.get("shell_hints") or ()),
             redirect_hint_re=_one(p.get("redirect_hint"), re.I),
             publish_click_texts=tuple(
-                p.get("publish_click_texts")
-                or ["進入", "进入", "继续访问", "点击进入", "新域名"]),
+                p.get("publish_click_texts") or ["進入", "进入", "继续访问", "点击进入", "新域名"]
+            ),
             new_domain_re=_rx(p.get("new_domain_patterns") or [], re.I),
             list_url_patterns=tuple(p.get("list_url_patterns") or ()),
         )
@@ -178,8 +185,8 @@ class RuleManager:
         r = data.get("resolver") or {}
         names = r.get("crypt_key_names") or ["crypt_key", "encryption_key"]
         crypt_key_re = re.compile(
-            r'<meta[^>]+name="(?:' + "|".join(re.escape(n) for n in names)
-            + r')"[^>]+content="([^"]+)"', re.I)
+            r'<meta[^>]+name="(?:' + "|".join(re.escape(n) for n in names) + r')"[^>]+content="([^"]+)"', re.I
+        )
         self.resolver = ResolverRules(
             m3u8_re=_one(r.get("m3u8_pattern"), re.I),
             crypt_key_re=crypt_key_re,
@@ -196,8 +203,7 @@ class RuleManager:
             card_selectors=b.get("card_selectors") or [],
             card_click_max=int(b.get("card_click_max") or 40),
             next_page_selector=b.get("next_page_selector") or "",
-            next_page_texts=b.get("next_page_texts")
-                or ["下一页", "加载更多", "更多", "Load More"],
+            next_page_texts=b.get("next_page_texts") or ["下一页", "加载更多", "更多", "Load More"],
             use_api_capture=bool(b.get("use_api_capture") or False),
             detail_url_template=b.get("detail_url_template") or "",
         )

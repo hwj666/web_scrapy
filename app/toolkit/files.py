@@ -1,4 +1,5 @@
 """文件与外部命令工具。"""
+
 import os
 import queue
 import re
@@ -8,8 +9,7 @@ import threading
 import time
 from collections.abc import Callable
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # app/
-_ROOT = os.path.dirname(HERE)                                      # 仓库根
+from app.core import settings
 
 # 本轮启动的 chromium 会带上这个标记开关，用于精确清理上次残留的浏览器进程。
 # 只匹配自己起的进程，不再像旧实现那样按 *ms-playwright* 全机扫描（会误杀别的项目）。
@@ -21,11 +21,7 @@ _LOG_LOCK = threading.Lock()
 
 def log_dir() -> str:
     """运行期日志目录：优先 YS_LOG_DIR，否则 <OUTDIR>/_logs（不写源码目录）。"""
-    env = (os.environ.get("YS_LOG_DIR") or "").strip()
-    if env:
-        return env
-    out = (os.environ.get("OUTDIR") or "").strip() or os.path.join(_ROOT, "downloads")
-    return os.path.join(out, "_logs")
+    return settings.log_dir()
 
 
 def append_log(path: str, text: str, max_bytes: int = 5 << 20) -> bool:
@@ -70,28 +66,36 @@ class AsyncLogWriter:
     因此任务对象被替换时调用 `close()` 即可回收。
     """
 
-    def __init__(self, path: str, echo: Callable[[str], None] | None = None,
-                 max_bytes: int = 5 << 20) -> None:
+    def __init__(
+        self, path: str, echo: Callable[[str], None] | None = None, max_bytes: int = 5 << 20
+    ) -> None:
         self.path = path
         self.max_bytes = max_bytes
         self._echo = echo
-        self._q: queue.Queue[object] = queue.Queue()
+        self._q: queue.Queue[object] = queue.Queue(maxsize=5000)
         self._failed = False
         self._closed = False
-        self._thread = threading.Thread(
-            target=self._loop, name="ys-log-writer", daemon=True)
+        self._dropped = 0
+        self._thread = threading.Thread(target=self._loop, name="ys-log-writer", daemon=True)
         self._thread.start()
 
     def write(self, line: str) -> None:
         if self._closed:
             return
-        self._q.put(line)
+        try:
+            self._q.put_nowait(line)
+        except queue.Full:
+            # 磁盘/终端卡住时不能无限吃内存：丢最旧的行并计数，恢复后提示一次
+            self._dropped += 1
 
     def flush(self, timeout: float = 3.0) -> None:
         if self._closed:
             return
         marker = _Flush()
-        self._q.put(marker)
+        try:
+            self._q.put(marker, timeout=timeout)
+        except queue.Full:
+            return
         marker.event.wait(timeout)
 
     def close(self, timeout: float = 5.0) -> None:
@@ -139,6 +143,9 @@ class AsyncLogWriter:
                     self._echo(line)
                 except Exception:
                     pass
+        if self._dropped:
+            dropped, self._dropped = self._dropped, 0
+            lines.append(f"[警告] 日志写入跟不上, 已丢弃 {dropped} 行（界面日志不受影响）")
         if self._failed:
             return
         try:
@@ -148,8 +155,7 @@ class AsyncLogWriter:
         if not ok:
             self._failed = True
             try:
-                print(f"[警告] 日志文件写入失败: {self.path}"
-                      "（界面与终端日志不受影响）", flush=True)
+                print(f"[警告] 日志文件写入失败: {self.path}（界面与终端日志不受影响）", flush=True)
             except Exception:
                 pass
 
@@ -160,7 +166,14 @@ def ffmpeg_exe() -> str:
     cands = [x for x in (shutil.which("ffmpeg"), _default_ffmpeg()) if x]
     for exe in cands:
         try:
-            r = subprocess.run([exe, "-version"], capture_output=True, text=True, timeout=20)
+            r = subprocess.run(
+                [exe, "-version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
             if r.returncode == 0:
                 _FFMPEG_OK.append(exe)
                 return exe
@@ -172,6 +185,7 @@ def ffmpeg_exe() -> str:
 def _default_ffmpeg() -> str:
     try:
         import imageio_ffmpeg  # type: ignore
+
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return ""

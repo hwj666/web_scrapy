@@ -1,4 +1,5 @@
 """列表页流水线：候选域名探测 → 逐页解析（静态/浏览器兜底/加密 SPA）→ 有序入队派发。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,22 +11,29 @@ from app.core.models import JobConfig, ListPage, VideoItem
 from app.core.rules import RuleManager
 from app.services.domain import DomainProbe
 from app.services.job_state import JobState
+from app.toolkit.browser import goto_with_stop, wait_with_stop
 from app.toolkit.http import is_conn_error, should_retry_with_browser
-from app.toolkit.url import auto_list_url
+from app.toolkit.url import page_url
 
 
 class ListRunner:
     """把列表页解析成视频队列；每解析完一页就通过 `dispatch` 立刻派发下载。"""
 
-    def __init__(self, cfg: JobConfig, rules: RuleManager, state: JobState, *,
-                 fetch: Callable[..., Awaitable[str]],
-                 static_list: Any,
-                 browser_list: Any,
-                 new_page: Callable[[], Any],
-                 domain: DomainProbe,
-                 log: Callable[[str], None],
-                 is_stopped: Callable[[], bool],
-                 dispatch: Callable[[int, VideoItem], None]):
+    def __init__(
+        self,
+        cfg: JobConfig,
+        rules: RuleManager,
+        state: JobState,
+        *,
+        fetch: Callable[..., Awaitable[str]],
+        static_list: Any,
+        browser_list: Any,
+        new_page: Callable[[], Any],
+        domain: DomainProbe,
+        log: Callable[[str], None],
+        is_stopped: Callable[[], bool],
+        dispatch: Callable[[int, VideoItem], None],
+    ):
         self.cfg = cfg
         self.rules = rules
         self.state = state
@@ -53,29 +61,32 @@ class ListRunner:
         if not list_url:
             raise RuntimeError(
                 f"所有候选列表链接都无法访问: {', '.join(cands)}"
-                f" —— 站点若已换域名, 请把新域名一起填进列表链接(可逗号分隔填多个)")
+                f" —— 站点若已换域名, 请把新域名一起填进列表链接(可逗号分隔填多个)"
+            )
         if list_url != cfg.list_url:
             self.domain.set_base(list_url)
             if list_url not in cands:
                 self.log(f"本次实际使用链接: {list_url}")
         # 换域名时只换了 host、路径可能已改版：校验真实列表页并按需修复路径
-        cfg.list_url = await self.domain.ensure_list_url(
-            cfg.list_url, cfg.p1, strict=True)
+        cfg.list_url = await self.domain.ensure_list_url(cfg.list_url, cfg.p1, strict=True)
 
         state.set_stage("list", status="running")
         # 普通站先走静态/浏览器列表；加密 SPA 的 API 捕获只作为兜底。
         # 这样默认配置里即使保留了某个站点的 detail_url_template，也不会影响其它站点。
         await self._run_normal()
-        use_api_cap = (self.rules.browser.use_api_capture
-                       and bool(self.rules.browser.detail_url_template))
+        use_api_cap = self.rules.browser.use_api_capture and bool(self.rules.browser.detail_url_template)
         if not state.items and use_api_cap:
             self.log("普通列表解析未得到视频, 尝试加密 SPA API 捕获")
             await self._run_api_capture()
 
         if state.abort_msg:
             raise JobAborted(state.abort_msg)
+        failed = int(state.st["stages"]["list"].get("failed") or 0)
         if not state.items:
-            raise RuntimeError("未解析到任何视频，请检查站点地址/分类ID/页码范围")
+            extra = f"（其中 {failed} 页抓取失败）" if failed else ""
+            raise RuntimeError(
+                f"未解析到任何视频{extra}，请检查站点地址/分类ID/页码范围，或把新域名一起填进列表链接"
+            )
 
     # ---------- 普通逐页解析 ----------
     async def _run_normal(self) -> None:
@@ -83,9 +94,15 @@ class ListRunner:
         state = self.state
         pages_total = cfg.p2 - cfg.p1 + 1
         zero_streak = 0
+        dup_streak = 0
+        tried_click = False
+
+        def check_stop() -> None:
+            if self._is_stopped():
+                raise StopJob()
 
         async def fetch_page(p: int) -> list[VideoItem]:
-            url = auto_list_url(self.cfg.list_url, p)
+            url = page_url(self.cfg.list_url, p, cfg.p1, cfg.p2)
             try:
                 html = await self._fetch(url, retries=2, timeout=20)
             except (StopJob, JobAborted):
@@ -95,36 +112,34 @@ class ListRunner:
                 # 404/410 说明路径就是不存在，开浏览器只会多等 20 多秒。
                 if self.browser_list is None or not should_retry_with_browser(e):
                     raise
-                self.log(f"page {p} HTTP 取页失败({type(e).__name__}: {str(e)[:80]}), "
-                         f"改用浏览器")
+                self.log(f"page {p} HTTP 取页失败({type(e).__name__}: {str(e)[:80]}), 改用浏览器")
                 async with self._new_page() as (page, _hits):
-                    await page.goto(url, timeout=45000, wait_until="domcontentloaded")
-                    await page.wait_for_timeout(2000)
+                    await goto_with_stop(page, url, stop=check_stop)
+                    await wait_with_stop(page, 2000, stop=check_stop)
                     html = await page.content()
                     page_result = await self.static_list.parse(html, p, self.cfg.base)
                     if page_result.items:
                         return page_result.items
                     result = await self.browser_list.parse_with_page(page, url, p)
                     return result.items
+            check_stop()
             try:
-                page_result: ListPage = await self.static_list.parse(
-                    html, p, self.cfg.base)
+                parsed: ListPage = await self.static_list.parse(html, p, self.cfg.base)
             except (StopJob, JobAborted):
                 raise
             except Exception as e:
                 # 静态解析器自身抛错（页面结构异常/正则问题）时不要整页当空，
                 # 直接落到浏览器兜底；两者都失败才由 load_page 记日志。
                 self.log(f"page {p} 静态解析失败: {type(e).__name__}: {str(e)[:100]}")
-                page_result = ListPage(page=p, items=[])
-            if page_result.items:
+                parsed = ListPage(page=p, items=[])
+            if parsed.items:
                 # 有些站点标题是 JS 解密出来的（data-decrypt），静态解析只能拿到空标题；
                 # 这时用浏览器再解析一次，拿到真实标题再下载，避免全是 untitled。
-                if self.browser_list is not None and self._mostly_untitled(
-                        page_result.items):
+                if self.browser_list is not None and self._mostly_untitled(parsed.items):
                     titled = await _browser_titles(url, p)
                     if titled:
                         return titled
-                return page_result.items
+                return parsed.items
             if self.browser_list is not None:
                 async with self._new_page() as (page, _hits):
                     result = await self.browser_list.parse_with_page(page, url, p)
@@ -134,46 +149,51 @@ class ListRunner:
         async def _browser_titles(url: str, p: int) -> list[VideoItem] | None:
             try:
                 async with self._new_page() as (page, _hits):
+                    await goto_with_stop(page, url, stop=check_stop)
                     result = await self.browser_list.parse_with_page(page, url, p)
             except (StopJob, JobAborted):
                 raise
             except Exception as e:
-                self.log(f"page {p} 浏览器补标题失败: {type(e).__name__}: "
-                         f"{str(e)[:100]}")
+                self.log(f"page {p} 浏览器补标题失败: {type(e).__name__}: {str(e)[:100]}")
                 return None
             if result.items and any(it.title for it in result.items):
                 self.log(f"page {p} 标题由浏览器解析(静态页标题为空)")
                 return result.items
             return None
 
-        async def load_page(p: int) -> list[VideoItem]:
-            """抓一页；连接类错误先重探域名再试一次，其它错误记日志后当空页处理。"""
+        async def load_page(p: int) -> list[VideoItem] | None:
+            """抓一页；返回 None 表示这页抓取失败（不能当成“空页”推断分类末尾）。"""
             old_url = self.cfg.list_url
             try:
                 return await fetch_page(p)
             except (StopJob, JobAborted):
                 raise
             except Exception as e:
-                if not is_conn_error(e):
+                if not is_conn_error(e) and not should_retry_with_browser(e):
                     self.log(f"page {p} ERROR: {e}")
-                    return []
-                # 别的并发页可能已经完成域名重探并更新了 list_url：这种直接重试，
-                # 不要因为重探冷却期还没过就白白丢掉这一页。
-                if self.cfg.list_url == old_url:
-                    await self.domain.reprobe(f"列表页 {p} 连接失败")
+                    return None
+                if is_conn_error(e):
+                    # 别的并发页可能已经完成域名重探并更新了 list_url：这种直接重试，
+                    # 不要因为重探冷却期还没过就白白丢掉这一页。
+                    if self.cfg.list_url == old_url:
+                        await self.domain.reprobe(f"列表页 {p} 连接失败")
+                # 被限流/被挡/连接抖动：退避后整页再试一次
+                await self._backoff(1.5 * min(3, max(1, p - cfg.p1 + 1)))
                 try:
                     return await fetch_page(p)
                 except (StopJob, JobAborted):
                     raise
                 except Exception as e2:
                     self.log(f"page {p} ERROR: {e2}")
-                    return []
+                    return None
 
         # 列表页并发抓取：窗口内同时请求/解析，但结果严格按页码顺序入队，
         # 视频编号、进度和日志顺序都与串行时一致；连续两页为空就提前收工。
+        # 抓取失败的页单独计数，并自动降低后续并发（被限流时别继续顶风上）。
         conc = max(1, min(6, self.rules.pipeline.list_concurrency))
+        conc_box = [conc]
         pending: dict[asyncio.Task, int] = {}
-        results: dict[int, list[VideoItem]] = {}
+        results: dict[int, list[VideoItem] | None] = {}
         next_page = cfg.p1
         next_done = cfg.p1
 
@@ -181,8 +201,7 @@ class ListRunner:
             nonlocal next_page
             # 同时在飞的页数 <= conc；且最多领先「下一个待处理页」conc-1 页，
             # 否则提前结束翻页时窗口里会多抓好几页。
-            while (next_page <= cfg.p2 and len(pending) < conc
-                   and next_page < next_done + conc):
+            while next_page <= cfg.p2 and len(pending) < conc_box[0] and next_page < next_done + conc_box[0]:
                 pending[asyncio.create_task(load_page(next_page))] = next_page
                 next_page += 1
 
@@ -193,18 +212,74 @@ class ListRunner:
                 # 先按页码顺序消费已经就绪的结果，乱序完成的页只暂存、不抢跑
                 while next_done in results and not stop_paging:
                     p = next_done
-                    new = self._add_and_dispatch(results.pop(p), p)
-                    state.set_list_progress(
-                        p - cfg.p1 + 1, len(state.items),
-                        2 + 8 * (p - cfg.p1 + 1) / pages_total)
-                    self.log(f"列表 {p} 页: +{new} (累计 {len(state.items)})")
-                    if new == 0:
-                        zero_streak += 1
-                        if zero_streak >= 2:
-                            self.log("连续 2 页无新增，判定已到分类末尾，停止翻页")
-                            stop_paging = True
+                    page_items = results.pop(p)
+                    if page_items is None:
+                        state.record_failed_page(p)
+                        state.add_warning(f"列表第 {p} 页抓取失败，已跳过（可重跑任务补抓）")
+                        self.log(f"列表 {p} 页: 抓取失败, 已降低并发")
+                        conc_box[0] = max(1, conc_box[0] - 1)
                     else:
-                        zero_streak = 0
+                        new = self._add_and_dispatch(page_items, p)
+                        if not page_items:
+                            zero_streak += 1
+                        elif new == 0:
+                            # 页面有内容但全是重复卡片：多给几次机会再判定末尾
+                            dup_streak += 1
+                        else:
+                            zero_streak = 0
+                            dup_streak = 0
+                        state.set_list_progress(
+                            p - cfg.p1 + 1, len(state.items), 2 + 8 * (p - cfg.p1 + 1) / pages_total
+                        )
+                        self.log(f"列表 {p} 页: +{new} (累计 {len(state.items)})")
+                        # URL 翻页无效（page 参数被忽略/纯 JS 换内容）时，第 2 页起会
+                        # 解析出与前面相同的内容或空页；这时改用浏览器点「下一页」兜底。
+                        if not tried_click and cfg.p2 > p and (not page_items or new == 0):
+                            tried_click = True
+                            coll = (
+                                getattr(self.browser_list, "collect_via_next_click", None)
+                                if self.browser_list is not None
+                                else None
+                            )
+                            if coll is not None:
+                                self.log(
+                                    f"列表 {p} 页内容重复/为空, 疑似 URL 翻页无效, 改用浏览器点「下一页」采集"
+                                )
+                                await self._cancel_pages(pending)
+                                first_url = page_url(cfg.list_url, 1, cfg.p1, cfg.p2)
+                                try:
+                                    async with self._new_page() as (page, _hits):
+                                        got = await coll(page, first_url, cfg.p1, cfg.p2)
+                                except (StopJob, JobAborted):
+                                    raise
+                                except Exception as e:
+                                    self.log(f"点下一页采集失败: {type(e).__name__}: {str(e)[:120]}")
+                                    got = []
+                                by_page: dict[int, list[VideoItem]] = {}
+                                for it in got:
+                                    pg = it.page or cfg.p1
+                                    if pg < p:  # 前面已经派发过的页不重复处理
+                                        continue
+                                    by_page.setdefault(pg, []).append(it)
+                                for pg in sorted(by_page):
+                                    n = self._add_and_dispatch(by_page[pg], pg)
+                                    state.set_list_progress(
+                                        pg - cfg.p1 + 1,
+                                        len(state.items),
+                                        2 + 8 * (pg - cfg.p1 + 1) / pages_total,
+                                    )
+                                    self.log(f"列表 {pg} 页(点下一页): +{n} (累计 {len(state.items)})")
+                                if by_page:
+                                    state.add_warning("页面 URL 翻页无效，已改用浏览器点「下一页」采集")
+                                    stop_paging = True
+                                else:
+                                    self.log("点下一页未带来更多内容, 按正常逻辑收尾")
+                        if dup_streak >= 3:
+                            self.log("连续 3 页解析到重复内容，判定已到分类末尾，停止翻页")
+                            stop_paging = True
+                    if zero_streak >= 2:
+                        self.log("连续 2 页无新增，判定已到分类末尾，停止翻页")
+                        stop_paging = True
                     if state.abort_msg:
                         stop_paging = True
                     next_done += 1
@@ -213,8 +288,7 @@ class ListRunner:
                 submit()
                 if not pending:
                     break
-                finished, _ = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED)
+                finished, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 for task in finished:
                     p = pending.pop(task)
                     try:
@@ -226,6 +300,10 @@ class ListRunner:
             # 正常结束/异常/停止都清掉窗口里没跑完的页，别留后台任务
             await self._cancel_pages(pending)
 
+        failed = self.state.st["stages"]["list"].get("failed") or 0
+        if failed:
+            self.log(f"列表解析结束：{failed} 页抓取失败（页码见界面警告/日志）")
+
     # ---------- 加密 SPA 兜底 ----------
     async def _run_api_capture(self) -> None:
         cfg = self.cfg
@@ -233,7 +311,8 @@ class ListRunner:
         self.log(f"加密 SPA 列表模式: 用 TextDecoder 钩子采集 {cfg.p1}-{cfg.p2} 页")
         async with self._new_page() as (page, _hits):
             cap_items = await self.browser_list.collect_via_api_capture(
-                page, self.cfg.list_url, cfg.p1, cfg.p2)
+                page, self.cfg.list_url, cfg.p1, cfg.p2
+            )
         # 按页码分组, 逐页走 add_items + 派发, 保持进度/日志与普通模式一致
         by_page: dict[int, list[VideoItem]] = {}
         for item in cap_items:
@@ -242,15 +321,23 @@ class ListRunner:
             if self._is_stopped():
                 raise StopJob()
             new = self._add_and_dispatch(by_page[p], p)
-            state.set_list_progress(
-                idx + 1, len(state.items),
-                2 + 8 * (idx + 1) / max(1, len(by_page)))
+            state.set_list_progress(idx + 1, len(state.items), 2 + 8 * (idx + 1) / max(1, len(by_page)))
             self.log(f"列表 {p} 页: +{new} (累计 {len(state.items)})")
             if state.abort_msg:
                 break
             await asyncio.sleep(0.1)
 
     # ---------- 工具 ----------
+    async def _backoff(self, seconds: float) -> None:
+        """可被停止信号打断的退避等待。"""
+        left = max(0.0, seconds)
+        while left > 0:
+            if self._is_stopped():
+                raise StopJob()
+            step = min(0.2, left)
+            await asyncio.sleep(step)
+            left -= step
+
     def _add_and_dispatch(self, got: list[VideoItem], page: int) -> int:
         added = self.state.add_items(got, page, self.cfg.base)
         for vi, item in added:

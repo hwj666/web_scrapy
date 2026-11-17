@@ -1,4 +1,5 @@
-"""浏览器播放页解析解析器（playwright 兜底）：网络层拦截 .m3u8，主动触发播放。"""
+"""浏览器播放页解析器（playwright 兜底）：网络层拦截 .m3u8，主动触发播放。"""
+
 from __future__ import annotations
 
 import json
@@ -8,6 +9,7 @@ from app.core.exceptions import NewDomainError
 from app.core.models import ResolvedVideo, VideoItem
 from app.core.parsing import ParserContext, Resolver
 from app.core.rules import RuleManager
+from app.toolkit.browser import goto_with_stop, wait_with_stop
 from app.toolkit.domain_notice import close_pages, page_notice_target, page_opener_matches
 from app.toolkit.title import TitleCleaner
 from app.toolkit.url import abs_url
@@ -15,7 +17,8 @@ from app.toolkit.url import abs_url
 
 def _trigger_js(selectors: list[str]) -> str:
     sels = json.dumps(selectors or [])
-    return """() => {
+    return (
+        """() => {
       const done = [];
       document.querySelectorAll('video').forEach(v => {
         try { v.muted = true; v.setAttribute('muted','');
@@ -28,12 +31,15 @@ def _trigger_js(selectors: list[str]) -> str:
         if (el) { try { el.click(); done.push(s); } catch (e) {} }
       }
       return done;
-    }""" % sels
+    }"""
+        % sels
+    )
 
 
 def _title_js(selectors: list[str]) -> str:
     title_sel = json.dumps(",".join(selectors) or ".rank-title")
-    return """() => {
+    return (
+        """() => {
       const one = (s) => { const e = document.querySelector(s); return e ? (e.getAttribute('content') || '').trim() : ''; };
       const text = (s) => [...document.querySelectorAll(s)].map(e => (e.textContent || '').trim()).filter(Boolean);
       return {
@@ -44,7 +50,9 @@ def _title_js(selectors: list[str]) -> str:
         known: text(%s),
         doc: document.title || ''
       };
-    }""" % title_sel
+    }"""
+        % title_sel
+    )
 
 
 class BrowserResolver(Resolver):
@@ -61,8 +69,16 @@ class BrowserResolver(Resolver):
     async def resolve(self, item: VideoItem, base: str) -> ResolvedVideo:
         raise NotImplementedError("browser_resolver 需要 page 对象，请使用 resolve_with_page")
 
-    async def resolve_with_page(self, page, hits: list[str], item: VideoItem,
-                                base: str) -> ResolvedVideo:
+    def _check_stop(self) -> None:
+        self.ctx.stop()
+
+    async def _goto(self, page, url: str, timeout_ms: int = 45000) -> None:
+        await goto_with_stop(page, url, stop=self._check_stop, timeout_ms=timeout_ms)
+
+    async def _wait(self, page, ms: int) -> None:
+        await wait_with_stop(page, ms, stop=self._check_stop)
+
+    async def resolve_with_page(self, page, hits: list[str], item: VideoItem, base: str) -> ResolvedVideo:
         url = abs_url(item.id, base)
         del hits[:]
         exclude = {urlparse(base).netloc.lower(), urlparse(url).netloc.lower()}
@@ -81,10 +97,10 @@ class BrowserResolver(Resolver):
 
         ctx.on("page", _on_page)
         try:
-            await page.goto(url, timeout=45000, wait_until="domcontentloaded")
+            await self._goto(page, url)
             m3u8s = []
-            for i in range(12):  # 最多等 30 秒
-                await page.wait_for_timeout(2500)
+            for i in range(12):  # 最多等 30 秒，期间响应停止信号
+                await self._wait(page, 2500)
                 m3u8s = [h for h in hits if ".m3u8" in h]
                 if m3u8s:
                     break
@@ -98,7 +114,8 @@ class BrowserResolver(Resolver):
                             "() => { const v = document.querySelector('video')"
                             " || document.querySelector('#player') || document.body;"
                             " const r = v.getBoundingClientRect();"
-                            " return {x: r.x + r.width/2, y: r.y + r.height/2}; }")
+                            " return {x: r.x + r.width/2, y: r.y + r.height/2}; }"
+                        )
                         await page.mouse.click(box["x"], box["y"])
                     except Exception:
                         pass
@@ -106,18 +123,20 @@ class BrowserResolver(Resolver):
                 if popups and not any(".m3u8" in h for h in hits):
                     for popup in popups:
                         host, _notice_url = await page_notice_target(
-                            popup, self.manager.pipeline.new_domain_re,
-                            self.manager.pipeline.shell_hints, exclude)
+                            popup,
+                            self.manager.pipeline.new_domain_re,
+                            self.manager.pipeline.shell_hints,
+                            exclude,
+                        )
                         if host:
                             raise NewDomainError(host)
             if m3u8s:
-                return ResolvedVideo(m3u8_url=m3u8s[-1],
-                                     title=await self._browser_title(page))
+                return ResolvedVideo(m3u8_url=m3u8s[-1], title=await self._browser_title(page))
 
             # 没拿到 m3u8：检查当前页和弹窗，是否在提示“站点已换新域名”
             host, _notice_url = await page_notice_target(
-                page, self.manager.pipeline.new_domain_re,
-                self.manager.pipeline.shell_hints, exclude)
+                page, self.manager.pipeline.new_domain_re, self.manager.pipeline.shell_hints, exclude
+            )
             for popup in popups:
                 try:
                     await popup.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -126,8 +145,8 @@ class BrowserResolver(Resolver):
                 if host:
                     continue
                 host, _notice_url = await page_notice_target(
-                    popup, self.manager.pipeline.new_domain_re,
-                    self.manager.pipeline.shell_hints, exclude)
+                    popup, self.manager.pipeline.new_domain_re, self.manager.pipeline.shell_hints, exclude
+                )
             if host:
                 raise NewDomainError(host)
             raise RuntimeError("未发出 m3u8")
@@ -146,9 +165,11 @@ class BrowserResolver(Resolver):
         doc = (data.get("doc") or "").strip()
         site = [x for x in (data.get("site") or []) if x]
         doc_clean = self.cleaner.clean(doc)
-        if (doc_clean and not self.cleaner.has_separator(doc)
-                and (self.cleaner.looks_like_site(doc_clean)
-                     or any(doc_clean == str(x).strip() for x in site))):
+        if (
+            doc_clean
+            and not self.cleaner.has_separator(doc)
+            and (self.cleaner.looks_like_site(doc_clean) or any(doc_clean == str(x).strip() for x in site))
+        ):
             site.append(doc)
         cands = []
         if data.get("og"):

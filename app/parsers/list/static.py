@@ -1,4 +1,5 @@
-"""通用静态列表解析解析器：无站点知识，靠规则引擎 + 模式聚类提取播放页链接。"""
+"""通用静态列表解析器：无站点知识，靠规则引擎 + 模式聚类提取播放页链接。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -59,8 +60,9 @@ class StaticListParser(ListParser):
             txt = html_mod.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
             title = self._clean_title(txt)
             # 链接是否像视频页看原始文本，别因为标题清洗成空就把候选也丢了
-            if ((rules.play_hint_re and rules.play_hint_re.search(href))
-                    or (txt and rules.id_re and rules.id_re.search(href))):
+            if (rules.play_hint_re and rules.play_hint_re.search(href)) or (
+                txt and rules.id_re and rules.id_re.search(href)
+            ):
                 add(abs_url(href, base), title)
 
         if not out and rules.div_to_re:
@@ -83,9 +85,11 @@ class StaticListParser(ListParser):
         # 注意只排除外域：同域绝对链接（如 /play/1.html 被 abs_url 转成绝对地址）
         # 不能因为数量少就丢掉，否则小分类页会被误判成空页。
         base_host = urlparse(base).netloc
-        if cands and len(cands) < 8 and all(
-                urlparse(x.id).netloc and urlparse(x.id).netloc != base_host
-                for x in cands):
+        if (
+            cands
+            and len(cands) < 8
+            and all(urlparse(x.id).netloc and urlparse(x.id).netloc != base_host for x in cands)
+        ):
             cands = []
 
         return ListPage(page=page, items=cands)

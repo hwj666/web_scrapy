@@ -1,4 +1,5 @@
 """VDF 查重服务的纯逻辑测试（不依赖外部 vdf 可执行文件）。"""
+
 from __future__ import annotations
 
 import json
@@ -33,11 +34,9 @@ class DedupParsingTests(unittest.TestCase):
 
     def test_list_videos_skips_own_intermediate_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            for name in ("a.mp4", "b.tmp.ts", "c.mp4.tmp", "d.tmp.mp4",
-                         "e.ts"):
+            for name in ("a.mp4", "b.tmp.ts", "c.mp4.tmp", "d.tmp.mp4", "e.ts"):
                 open(os.path.join(tmp, name), "wb").close()
-            self.assertEqual([f["n"] for f in _list_videos(tmp)],
-                             ["a.mp4", "e.ts"])
+            self.assertEqual([f["n"] for f in _list_videos(tmp)], ["a.mp4", "e.ts"])
 
     def test_decode_line_handles_gbk_output(self) -> None:
         # Windows 上 VDF 可能按系统代码页输出；不能因此匹配不到中文文件名
@@ -46,23 +45,35 @@ class DedupParsingTests(unittest.TestCase):
 
     def test_missing_result_file_is_empty_not_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(
-                DedupService()._load_groups(os.path.join(tmp, "none.json")), [])
+            self.assertEqual(DedupService()._load_groups(os.path.join(tmp, "none.json")), [])
 
     def test_load_groups_marks_keep_and_wasted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = os.path.join(tmp, "_vdf_results.json")
-            raw = [{
-                "GroupId": "g1",
-                "Items": [
-                    {"Path": "/v/a.mp4", "SizeLong": 100, "Similarity": 99.5,
-                     "FrameSize": "1920x1080", "BitRateKbs": 3000,
-                     "Duration": "00:01:00", "IsBestBitRateKbs": True},
-                    {"Path": "/v/b.mp4", "SizeLong": 400, "Similarity": 98.0,
-                     "FrameSize": "1280x720", "BitRateKbs": 1000,
-                     "Duration": "00:01:10"},
-                ],
-            }]
+            raw = [
+                {
+                    "GroupId": "g1",
+                    "Items": [
+                        {
+                            "Path": "/v/a.mp4",
+                            "SizeLong": 100,
+                            "Similarity": 99.5,
+                            "FrameSize": "1920x1080",
+                            "BitRateKbs": 3000,
+                            "Duration": "00:01:00",
+                            "IsBestBitRateKbs": True,
+                        },
+                        {
+                            "Path": "/v/b.mp4",
+                            "SizeLong": 400,
+                            "Similarity": 98.0,
+                            "FrameSize": "1280x720",
+                            "BitRateKbs": 1000,
+                            "Duration": "00:01:10",
+                        },
+                    ],
+                }
+            ]
             with open(result, "w", encoding="utf-8") as f:
                 json.dump(raw, f)
             svc = DedupService()
@@ -76,10 +87,8 @@ class DedupParsingTests(unittest.TestCase):
     def test_match_file_by_basename(self) -> None:
         svc = DedupService()
         files = [
-            {"p": "/v/a.mp4", "n": "a.mp4", "sz": 1, "s": 0, "st": "",
-             "c": 0, "fc": 0, "fm": 0},
-            {"p": "/v/b.mp4", "n": "b.mp4", "sz": 1, "s": 0, "st": "",
-             "c": 0, "fc": 0, "fm": 0},
+            {"p": "/v/a.mp4", "n": "a.mp4", "sz": 1, "s": 0, "st": "", "c": 0, "fc": 0, "fm": 0},
+            {"p": "/v/b.mp4", "n": "b.mp4", "sz": 1, "s": 0, "st": "", "c": 0, "fc": 0, "fm": 0},
         ]
         svc._by_base = {"a.mp4": 0, "b.mp4": 1}
         self.assertEqual(svc._match_file(files, ".../a.mp4"), 0)

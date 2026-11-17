@@ -1,4 +1,5 @@
 """浏览器弹窗/新标签页换域名识别（用假页面对象，不启动真实浏览器）。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -30,8 +31,7 @@ class _FakeMouse:
 
 
 class _FakePage:
-    def __init__(self, url: str, title: str = "", body: str = "",
-                 opener=None):
+    def __init__(self, url: str, title: str = "", body: str = "", opener=None):
         self.url = url
         self.context = _FakeContext()
         self.mouse = _FakeMouse()
@@ -98,21 +98,20 @@ class _FakeContext:
 class BrowserPopupTests(unittest.TestCase):
     def test_popup_with_new_domain_raises(self) -> None:
         main = _FakePage("https://old.com/play/1.html")
-        popup = _FakePage("https://new.com/notice", title="发布页",
-                          body="最新地址：https://new.com/list", opener=main)
+        popup = _FakePage(
+            "https://new.com/notice", title="发布页", body="最新地址：https://new.com/list", opener=main
+        )
         main.context.popup = popup
 
         async def fetch(*_args, **_kwargs):
             return ""
 
-        resolver = BrowserResolver(ParserContext(
-            fetch=fetch, state={"rules": RuleManager()}))
+        resolver = BrowserResolver(ParserContext(fetch=fetch, state={"rules": RuleManager()}))
 
         item = VideoItem(id="https://old.com/play/1.html", title="x")
         hits: list[str] = []
         with self.assertRaises(NewDomainError) as ctx:
-            asyncio.run(resolver.resolve_with_page(
-                main, hits, item, "https://old.com"))
+            asyncio.run(resolver.resolve_with_page(main, hits, item, "https://old.com"))
         self.assertEqual(ctx.exception.host, "new.com")
         self.assertTrue(popup._closed)
 
@@ -120,31 +119,52 @@ class BrowserPopupTests(unittest.TestCase):
 class DomainProbePopupTests(unittest.TestCase):
     def test_publish_popup_switches_list_base(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            main = _FakePage("https://old.example.com/list/1-{}.html",
-                             title="发布页", body="点击进入")
-            popup = _FakePage("https://new.example.com/notice",
-                              title="发布页",
-                              body="新域名：https://new.example.com/list",
-                              opener=main)
+            main = _FakePage("https://old.example.com/list/1-{}.html", title="发布页", body="点击进入")
+            popup = _FakePage(
+                "https://new.example.com/notice",
+                title="发布页",
+                body="新域名：https://new.example.com/list",
+                opener=main,
+            )
             main.context.popup = popup
-            cfg = JobConfig(
-                list_url="https://old.example.com/list/1-{}.html",
-                p1=1, p2=1, outdir=tmp)
+            cfg = JobConfig(list_url="https://old.example.com/list/1-{}.html", p1=1, p2=1, outdir=tmp)
 
             async def get_raw(url: str):
-                return FetchedResponse(url=url, status=200, headers={},
-                                       content="<html>发布页</html>".encode())
+                return FetchedResponse(
+                    url=url, status=200, headers={}, content="<html>发布页</html>".encode()
+                )
 
             @asynccontextmanager
             async def new_page():
                 yield main, []
 
             probe = DomainProbe(
-                cfg, RuleManager(), get_raw=get_raw, new_page=new_page,
-                log=lambda msg: None, ua="test")
+                cfg, RuleManager(), get_raw=get_raw, new_page=new_page, log=lambda msg: None, ua="test"
+            )
             got = asyncio.run(probe.resolve_base(cfg.list_url))
             self.assertEqual(got, "https://new.example.com/list/1-{}.html")
             self.assertTrue(popup._closed)
+
+
+class DomainCandidateTests(unittest.TestCase):
+    """发布页只写一行新地址（无关键词/无链接）时的域名候选提取。"""
+
+    def test_extracts_plain_and_fullwidth_domains(self) -> None:
+        from app.toolkit.domain_notice import find_domain_candidates
+
+        text = "本站已迁移 zzzz。com，备用 bbbb点net；广告 www.baidu.com；当前 old.example；邮箱 a@mail.com"
+        cands = find_domain_candidates(text, exclude={"old.example"})
+        self.assertIn("zzzz.com", cands)
+        self.assertIn("bbbb.net", cands)
+        self.assertNotIn("www.baidu.com", cands)
+        self.assertNotIn("old.example", cands)
+        self.assertNotIn("mail.com", cands)
+
+    def test_blocked_third_party_not_returned(self) -> None:
+        from app.toolkit.domain_notice import find_domain_candidates
+
+        cands = find_domain_candidates("统计 cnzz.com 云 cdn.cloudflare.com 新站 real-site.example")
+        self.assertEqual(cands, ["real-site.example"])
 
 
 if __name__ == "__main__":

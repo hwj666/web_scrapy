@@ -1,4 +1,5 @@
 """流水线关键逻辑回归：分片解密合并、重试进度、列表页并发有序性与异步日志。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -89,24 +90,25 @@ class _FakeListParser:
         await asyncio.sleep({1: 0.03, 2: 0.06, 3: 0.0, 4: 0.01}.get(page, 0.0))
         if page in (5, 6):
             return ListPage(page=page, items=[])
-        return ListPage(page=page, items=[
-            VideoItem(id=f"https://example.com/v/{page}-{i}",
-                      title=f"p{page}-{i}", page=page)
-            for i in range(2)
-        ])
+        return ListPage(
+            page=page,
+            items=[
+                VideoItem(id=f"https://example.com/v/{page}-{i}", title=f"p{page}-{i}", page=page)
+                for i in range(2)
+            ],
+        )
 
 
 class ListConcurrencyTests(unittest.TestCase):
     def test_pages_are_dispatched_in_order_and_stop_early(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            cfg = JobConfig(list_url="https://example.com/list/1-{}.html",
-                            p1=1, p2=10, outdir=tmp)
+            cfg = JobConfig(list_url="https://example.com/list/1-{}.html", p1=1, p2=10, outdir=tmp)
             job = Job(cfg)
             try:
                 fake = _FakeListParser()
                 job._ensure_parsers()
-                job.list_runner.static_list = fake       # type: ignore[union-attr]
-                job.list_runner.browser_list = None      # type: ignore[union-attr]
+                job.list_runner.static_list = fake  # type: ignore[union-attr]
+                job.list_runner.browser_list = None  # type: ignore[union-attr]
                 job.rules.pipeline.list_concurrency = 3
                 job.rules.browser.use_api_capture = False
                 seen: list[tuple[int, int]] = []
@@ -122,14 +124,15 @@ class ListConcurrencyTests(unittest.TestCase):
                     job._vset(n - 1, s=2)
                     job._progress()
 
-                job.list_runner._fetch = fake_fetch         # type: ignore[union-attr]
+                job.list_runner._fetch = fake_fetch  # type: ignore[union-attr]
                 job.domain.resolve_base = fake_resolve_base  # type: ignore[assignment]
+
                 async def fake_ensure_list_url(tpl, p1=1, strict=False):
                     return tpl
 
                 job.domain.ensure_list_url = fake_ensure_list_url  # type: ignore[assignment]
-                job._work = fake_work                        # type: ignore[assignment]
-                job._ensure_parsers = lambda: None            # type: ignore[assignment]
+                job._work = fake_work  # type: ignore[assignment]
+                job._ensure_parsers = lambda: None  # type: ignore[assignment]
 
                 # 走完整 _async_run：初始化事件循环、列表解析、等任务、_finish 收尾
                 asyncio.run(job._async_run())

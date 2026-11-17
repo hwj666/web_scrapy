@@ -1,4 +1,5 @@
 """从发布页/弹窗里识别新域名，以及把旧域名 URL 重写到新域名。"""
+
 from __future__ import annotations
 
 import re
@@ -30,8 +31,9 @@ def host_from_url(url: str | None) -> str:
     return clean_host(url)
 
 
-def find_new_host(text: str | None, pattern: re.Pattern[str] | None,
-                  exclude: Iterable[str] = ()) -> str | None:
+def find_new_host(
+    text: str | None, pattern: re.Pattern[str] | None, exclude: Iterable[str] = ()
+) -> str | None:
     """从页面文字中找新域名；pattern 的每个分组都可能是 host。"""
     if pattern is None:
         return None
@@ -45,10 +47,93 @@ def find_new_host(text: str | None, pattern: re.Pattern[str] | None,
 
 
 _URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>）)】\u3000]+", re.I)
+# 裸域名（含中文站点常见的“zzzz。com / zzzz点com”写法，后面会先归一化）
+_DOMAIN_IN_TEXT_RE = re.compile(
+    r"(?<![a-z0-9@._-])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24})(?![a-z0-9._-])",
+    re.I,
+)
+# 发布页/正文里出现的第三方域名：广告、统计、CDN、社交、播放器文档站，绝不采纳
+_BLOCKED_DOMAIN_SUFFIXES = (
+    "baidu.com",
+    "bdstatic.com",
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "doubleclick.net",
+    "cnzz.com",
+    "51.la",
+    "51yes.com",
+    "umeng.com",
+    "gtimg.com",
+    "qq.com",
+    "weixin.qq.com",
+    "t.cn",
+    "weibo.com",
+    "sina.com.cn",
+    "zhihu.com",
+    "bilibili.com",
+    "douyin.com",
+    "cloudflare.com",
+    "cloudflareinsights.com",
+    "akamaihd.net",
+    "jsdelivr.net",
+    "bootcdn.net",
+    "unpkg.com",
+    "cdnjs.cloudflare.com",
+    "alicdn.com",
+    "aliyun.com",
+    "tencentcloud.com",
+    "github.com",
+    "githubusercontent.com",
+    "gitee.com",
+    "t.me",
+    "telegram.org",
+    "facebook.com",
+    "twitter.com",
+    "youtube.com",
+    "instagram.com",
+    "w3.org",
+    "schema.org",
+    "mozilla.org",
+)
+_DOT_MAP = str.maketrans({"。": ".", "．": ".", "｡": ".", "·": ".", "•": ".", "點": ".", "点": "."})
 
 
-def find_new_url(text: str | None, pattern: re.Pattern[str] | None,
-                 exclude: Iterable[str] = ()) -> tuple[str, str | None]:
+def _normalize_domains(text: str) -> str:
+    """把中文/全角写法的域名分隔符归一化，便于后续用同一个正则识别。"""
+    raw = (text or "").translate(_DOT_MAP).lower()
+    for token in ("(dot)", "[dot]", " dot ", " DOT "):
+        raw = raw.replace(token, ".")
+    return re.sub(r"\s*\.\s*", ".", raw)
+
+
+def find_domain_candidates(text: str | None, exclude: Iterable[str] = (), limit: int = 6) -> list[str]:
+    """从页面正文里提取所有“像站点”的域名候选（按出现顺序去重）。
+
+    用于发布页只写了一行新地址、既没有关键词也没有链接的情况：
+    调用方必须逐个用“能否打开列表页”来验证，不能直接采纳。
+    """
+    raw = _normalize_domains(text or "")
+    blocked = {str(x).lower() for x in exclude if x}
+    out: list[str] = []
+    for match in _DOMAIN_IN_TEXT_RE.finditer(raw):
+        host = clean_host(match.group(1))
+        if not host or host in blocked:
+            continue
+        if any(host == b or host.endswith("." + b) for b in _BLOCKED_DOMAIN_SUFFIXES):
+            continue
+        if host not in out:
+            out.append(host)
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
+def find_new_url(
+    text: str | None, pattern: re.Pattern[str] | None, exclude: Iterable[str] = ()
+) -> tuple[str, str | None]:
     """识别新域名，并尽量把发布页里给出的完整 URL 一起带回来。
 
     只换 host 会丢掉路径：站点换域名时常连列表路径一起改版，
@@ -73,9 +158,9 @@ def replace_host(url: str, old_hosts: Iterable[str], new_host: str) -> str:
     return urlunsplit(up._replace(netloc=new_host))
 
 
-async def page_notice_target(page, pattern: re.Pattern[str] | None,
-                             shell_hints: Iterable[str],
-                             exclude: Iterable[str]) -> tuple[str, str | None]:
+async def page_notice_target(
+    page, pattern: re.Pattern[str] | None, shell_hints: Iterable[str], exclude: Iterable[str]
+) -> tuple[str, str | None]:
     """检查一个 Playwright 页面：返回 (新 host, 发布页里给出的完整 URL 或 None)。"""
     try:
         title = await page.title()

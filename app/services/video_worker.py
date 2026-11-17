@@ -1,4 +1,5 @@
 """单视频处理：跳过判断 → 播放页解析 → HLS 下载 → 重试 / 熔断 / 失败记录。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -20,13 +21,19 @@ from app.toolkit.http import is_conn_error
 class VideoWorker:
     """处理视频队列中的一项；并发额度由 `Job` 的信号量提供。"""
 
-    def __init__(self, cfg: JobConfig, rules: RuleManager, state: JobState,
-                 hls: HlsDownloader, *,
-                 resolve: Callable[[VideoItem], Awaitable[tuple[str, str]]],
-                 reprobe: Callable[[str], Awaitable[bool]],
-                 log: Callable[[str], None],
-                 stop_check: Callable[[], bool],
-                 is_stopped: Callable[[], bool]):
+    def __init__(
+        self,
+        cfg: JobConfig,
+        rules: RuleManager,
+        state: JobState,
+        hls: HlsDownloader,
+        *,
+        resolve: Callable[[VideoItem], Awaitable[tuple[str, str]]],
+        reprobe: Callable[[str], Awaitable[bool]],
+        log: Callable[[str], None],
+        stop_check: Callable[[], bool],
+        is_stopped: Callable[[], bool],
+    ):
         self.cfg = cfg
         self.rules = rules
         self.state = state
@@ -50,6 +57,12 @@ class VideoWorker:
         name = f"{n:03d}_{sanitize(item.title or '')}"
         mp4 = os.path.join(self.cfg.outdir, name + ".mp4")
         m3u8_url: str | None = None
+
+        # 增量模式：历史清单里已下载过的条目直接跳过，避免 cron 每天重扫整个分类
+        if self.cfg.only_new and state.is_seen(item.id):
+            self._skip(name, vi)
+            self.log(f"[{n}/{state.total}] SKIP {name} (历史已下载)")
+            return
 
         # 标题以列表页为准；只有列表页没拿到标题时才提前解析播放页取标题
         need_resolve_first = not item.title
@@ -112,6 +125,7 @@ class VideoWorker:
                 mb = await self.hls.download(m3u8_url, name, mp4, vi=vi)
                 state.record_success(name, mb)
                 state.vset(vi, s=2, mb=round(mb, 1))
+                state.mark_seen(item.id, item.title)
                 state.progress()
                 self.log(f"[{n}/{state.total}] OK {name} | {mb:.0f}MB")
                 return
@@ -131,8 +145,7 @@ class VideoWorker:
                 await self._sleep(0.5)
                 continue
             except Exception as e:
-                if (is_conn_error(e) and bonus == 0
-                        and await self._reprobe(f"视频 {n} 连接失败")):
+                if is_conn_error(e) and bonus == 0 and await self._reprobe(f"视频 {n} 连接失败"):
                     bonus = 1
                     m3u8_url = None
                     tries -= 1
@@ -156,14 +169,20 @@ class VideoWorker:
     def _skip(self, name: str, vi: int | None = None) -> None:
         self.state.record_skip()
         self.state.vset(vi, s=4)
+        # vi 是 0-based 下标（vmap 存的就是 len(items)-1），不要减 1：
+        # 否则会误把「前一个」视频记进已下载清单，增量模式会把未下载的视频永久跳过。
+        item = self.state.items[vi] if vi is not None and vi < len(self.state.items) else None
+        if item is not None:
+            self.state.mark_seen(item.id, item.title)
         self.state.progress()
 
     def _trip_abort(self, msg: str) -> None:
         self.state.set_abort(msg)
         raise JobAborted(msg)
 
-    def _fail(self, item: VideoItem, idx: int, e: Exception, record: bool = False,
-              vi: int | None = None) -> None:
+    def _fail(
+        self, item: VideoItem, idx: int, e: Exception, record: bool = False, vi: int | None = None
+    ) -> None:
         trip = self.state.record_failure(str(e), self.rules.pipeline.streak_limit)
         self.state.vset(vi, s=3, e=str(e)[:80])
         self.state.progress()
@@ -172,8 +191,7 @@ class VideoWorker:
             self.log("熔断中止: " + trip)
         if record:
             try:
-                with open(os.path.join(self.cfg.outdir, "_failed_web.txt"), "a",
-                          encoding="utf-8") as f:
+                with open(os.path.join(self.cfg.outdir, "_failed_web.txt"), "a", encoding="utf-8") as f:
                     f.write(f"{item.id}\t{item.title}\t{str(e)[:140]}\n")
             except OSError:
                 pass

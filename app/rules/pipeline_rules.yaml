@@ -35,6 +35,10 @@ pipeline:
     - "fMP4"
     - "EXT-X-MAP"
     - "EXT-X-BYTERANGE"
+    # 直播/滚动窗口（缺 ENDLIST）与成品校验失败：重试会得到同样的结果
+    - "EXT-X-ENDLIST"
+    - "成品校验未通过"
+    - "已拒绝私网"
     - "找不到可执行的 ffmpeg"
     - "ffmpeg 不可用"
     - "不是 TS 流"
@@ -136,8 +140,8 @@ browser:
     - "[class*=video-card]"
     - "[class*=vod-item]"
   card_click_max: 40
-  # SPA 翻页: 部分站点(如 zd3xy)会剥掉 URL 里的 page 参数, 永远显示第 1 页,
-  # 必须在页面内点「下一页」按钮翻页。这里给按钮选择器, 找不到时退化为只读当前页。
+  # 翻页控件：SPA API 捕获模式用它点「下一页」；普通列表 URL 翻页无效时
+  # （page 参数被忽略/纯 JS 换内容）也会用同一组选择器/文字做兜底。
   next_page_selector: ".pg-btn, .load-more button, .pagination .nav:last-child, .next-page, [class*=next]"
   # 翻页按钮文本候选(按顺序尝试, 命中即点): zd3xy 用「下一页」, enw 用「加载更多」
   next_page_texts:

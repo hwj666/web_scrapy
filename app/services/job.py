@@ -11,6 +11,7 @@
 对外契约不变：`run()` 仍是同步入口（内部 asyncio.run），`ev` / `st` /
 `snapshot()` / `retry_failed()` 等保留。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -58,27 +59,41 @@ class Job:
         self.cfg = cfg
         self.rules = RuleManager()
         self.ev = threading.Event()
+        # 服务停机标志（与“任务自然结束”区分：结束后仍允许一键重试）
+        self._shutdown = threading.Event()
+        # 资源回收完成的信号：dispose()/新任务启动前等它，避免和新任务抢浏览器/日志
+        self._closed_event = threading.Event()
+        self._closed_event.set()
+        self._finished = False
         self.state = JobState(cfg)
+        self.state.seen = JobState.load_seen(os.path.join(cfg.outdir, "_seen_web.json"))
         # 日志落盘/打屏全部丢给后台线程，事件循环只负责入队
         self._logw = AsyncLogWriter(os.path.join(cfg.outdir, "_web_log.txt"), echo=_echo)
         self.http = AsyncHttpClient()
         self.browser = BrowserSession(self.http.app_config.ua)
         self.domain = DomainProbe(
-            cfg, self.rules,
-            get_raw=lambda url: self.http.get_raw(
-                url, retries=1, timeout=20, stop=self._stop_check),
+            cfg,
+            self.rules,
+            get_raw=lambda url: self.http.get_raw(url, retries=1, timeout=20, stop=self._stop_check),
             new_page=self.browser.new_page,
             log=self.log,
-            ua=self.http.app_config.ua)
-        # 每部视频的分片并发额度（seg_concurrency 平均分给 workers）
+            ua=self.http.app_config.ua,
+            stop=self._stop_check,
+        )
+        # 每部视频的分片协程数上限；全局总并发由 _seg_sem 控制（见 _init_async）
         self.hls = HlsDownloader(
-            cfg.outdir, cfg.seg_concurrency // max(1, cfg.workers),
-            state=self.state, fetch=self._fetch, fetch_media=self._fetch_media,
+            cfg.outdir,
+            min(cfg.seg_concurrency, 8),
+            state=self.state,
+            fetch=self._fetch,
+            fetch_media=self._fetch_media,
             log=self.log,
             is_stopped=self.ev.is_set,
             abort_msg=lambda: self.state.abort_msg,
             domain_epoch=lambda: self.domain.epoch,
-            recover=self._recover_domain)
+            recover=self._recover_domain,
+        )
+        self._seg_sem: asyncio.Semaphore | None = None
         self.worker: VideoWorker | None = None
         self.list_runner: ListRunner | None = None
         self._tasks: list[asyncio.Task] = []
@@ -121,26 +136,49 @@ class Job:
     # ---------- 解析器 / 运行时 ----------
     def _ensure_parsers(self) -> None:
         """实例化内置解析器，并把它们接到列表流水线与单视频 worker 上。"""
-        ctx = ParserContext(fetch=self._fetch, cfg=self.cfg.model_dump(),
-                            state={"rules": self.rules})
+        ctx = ParserContext(
+            fetch=self._fetch, cfg=self.cfg.model_dump(), state={"rules": self.rules}, stop=self._stop_check
+        )
         self._static_list = StaticListParser(ctx)
         self._browser_list = BrowserListParser(ctx)
         self._static_resolver = StaticResolver(ctx)
         self._browser_resolver = BrowserResolver(ctx)
         self.worker = VideoWorker(
-            self.cfg, self.rules, self.state, self.hls,
-            resolve=self._resolve, reprobe=self.domain.reprobe, log=self.log,
-            stop_check=self._stop_check, is_stopped=self.ev.is_set)
+            self.cfg,
+            self.rules,
+            self.state,
+            self.hls,
+            resolve=self._resolve,
+            reprobe=self.domain.reprobe,
+            log=self.log,
+            stop_check=self._stop_check,
+            is_stopped=self.ev.is_set,
+        )
         self.list_runner = ListRunner(
-            self.cfg, self.rules, self.state, fetch=self._fetch,
-            static_list=self._static_list, browser_list=self._browser_list,
-            new_page=self.browser.new_page, domain=self.domain, log=self.log,
-            is_stopped=self.ev.is_set, dispatch=self._dispatch)
+            self.cfg,
+            self.rules,
+            self.state,
+            fetch=self._fetch,
+            static_list=self._static_list,
+            browser_list=self._browser_list,
+            new_page=self.browser.new_page,
+            domain=self.domain,
+            log=self.log,
+            is_stopped=self.ev.is_set,
+            dispatch=self._dispatch,
+        )
 
     def _init_async(self) -> None:
         """在事件循环线程里初始化协程原语。"""
         self._loop = asyncio.get_running_loop()
+        self.browser.reset()
         self._video_sem = asyncio.Semaphore(max(1, self.cfg.workers))
+        # 分片总并发：所有在跑视频共享这一个闸门，语义与界面上的
+        # “分片并发”一致（不再按 workers 整除后放大）。
+        self._seg_sem = asyncio.Semaphore(max(1, self.cfg.seg_concurrency))
+        self.hls.seg_limiter = self._seg_sem
+        self._closed_event.clear()
+        self._finished = False
 
     def log(self, msg: str) -> None:
         self._logw.write(self.state.log_line(msg))
@@ -154,12 +192,14 @@ class Job:
             raise JobAborted(self.state.abort_msg)
         return False
 
-    async def _fetch(self, url: str, *, binary: bool = False, retries: int = 3,
-                     timeout: float = 30, **kw: Any) -> Any:
+    async def _fetch(
+        self, url: str, *, binary: bool = False, retries: int = 3, timeout: float = 30, **kw: Any
+    ) -> Any:
         self._stop_check()
         self.http.set_referer(self.cfg.base + "/")
-        return await self.http.get(url, binary=binary, retries=retries,
-                                   timeout=timeout, stop=self._stop_check, **kw)
+        return await self.http.get(
+            url, binary=binary, retries=retries, timeout=timeout, stop=self._stop_check, **kw
+        )
 
     async def _fetch_media(self, url: str, query: str, **kw: Any) -> Any:
         """分片/密钥取数：先按 HLS 标准用裸 URL，失败再补播放列表查询串兜底。"""
@@ -177,7 +217,8 @@ class Job:
         self._tasks.append(asyncio.create_task(self._work(n, item)))
 
     async def _work(self, n: int, item: VideoItem) -> None:
-        assert self._video_sem is not None
+        if self._video_sem is None:
+            raise RuntimeError("视频信号量未初始化")
         async with self._video_sem:
             if self.worker is None:
                 raise RuntimeError("worker 未初始化")
@@ -216,10 +257,9 @@ class Job:
                 raise
             except Exception:
                 async with self.browser.new_page() as (page, hits):
-                    resolved = await self._browser_resolver.resolve_with_page(
-                        page, hits, item, self.cfg.base)
+                    resolved = await self._browser_resolver.resolve_with_page(page, hits, item, self.cfg.base)
         except NewDomainError as e:
-            if _depth >= 2 or not self.domain.adopt_host(e.host):
+            if _depth >= 2 or not await self.domain.adopt_host_verified(e.host):
                 raise
             self.log(f"播放页提示新域名 {e.host}, 切换后重试当前视频")
             self._rebase_state_urls()
@@ -228,8 +268,7 @@ class Job:
             self.st["stages"]["play"]["resolved"] += 1
         return resolved.m3u8_url, resolved.title
 
-    async def _hls_to_mp4(self, m3u8_url: str, name: str, mp4: str,
-                          vi: int | None = None) -> float:
+    async def _hls_to_mp4(self, m3u8_url: str, name: str, mp4: str, vi: int | None = None) -> float:
         """兼容旧调用：HLS 下载本体已移到 `hls.HlsDownloader`。"""
         return await self.hls.download(m3u8_url, name, mp4, vi=vi)
 
@@ -242,7 +281,7 @@ class Job:
         try:
             self._ensure_parsers()
             await self._run()
-        except StopJob:
+        except (StopJob, asyncio.CancelledError):
             await self._finish(stopped=True)
         except JobAborted as e:
             with self.state.lock:
@@ -256,8 +295,7 @@ class Job:
             with self.state.lock:
                 self.st["error"] = f"{type(e).__name__}: {e}"
             self.log(f"FATAL: {type(e).__name__}: {e}")
-            dbg_log(os.path.join(log_dir(), "_server_dbg.log"),
-                    "JOB FATAL:\n" + traceback.format_exc())
+            dbg_log(os.path.join(log_dir(), "_server_dbg.log"), "JOB FATAL:\n" + traceback.format_exc())
             await self._finish(error=True)
         else:
             await self._finish()
@@ -274,8 +312,7 @@ class Job:
         self.set_stage("list", status="done")
         self.log(f"列表解析完成: 共 {self.total} 个视频")
         try:
-            with open(os.path.join(self.cfg.outdir, "manifest_web.json"), "w",
-                      encoding="utf-8") as f:
+            with open(os.path.join(self.cfg.outdir, "manifest_web.json"), "w", encoding="utf-8") as f:
                 json.dump([it.model_dump() for it in self.items], f, ensure_ascii=False)
         except OSError:
             pass
@@ -284,23 +321,70 @@ class Job:
         await self._await_tasks(self._tasks)
         if self.state.abort_msg:
             raise JobAborted(self.state.abort_msg)
+        if self.ev.is_set():
+            # 停止信号到达时可能刚好所有视频都跑完了，不能把“已停止”报成 100% 完成
+            raise StopJob()
         self.state.set_percent(100)
 
     async def _finish(self, stopped: bool = False, error: bool = False) -> None:
-        self.state.finish(stopped=stopped, error=error)
-        self.log("=== 已停止 ===" if stopped else
-                 ("=== 出错终止 ===" if error else "=== 任务完成 ==="))
+        """回收资源后再发布“任务结束”状态。
+
+        顺序很重要：先把 running 置 False 再关浏览器，会让 /api/start 在收尾窗口里
+        启动新任务、复用同一个 Job 的浏览器/日志，造成资源泄漏和跨事件循环错误。
+        """
+        if self._finished:
+            return
+        self._finished = True
+        self.log("=== 已停止 ===" if stopped else ("=== 出错终止 ===" if error else "=== 任务完成 ==="))
         self.hls.kill_ffmpeg()
-        await self.browser.close()
-        await self.http.aclose()
-        # 任务状态已经落定，等日志写完再让前端看到「已完成」
+        try:
+            await asyncio.wait_for(self.browser.close(), timeout=10)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(self.http.aclose(), timeout=10)
+        except Exception:
+            pass
         self._logw.flush()
+        self.state.finish(stopped=stopped, error=error)
+        self._persist()
+        self._closed_event.set()
+
+    def _persist(self) -> None:
+        """把任务状态/历史清单落盘：进程重启后 /api/job 仍能看到上一次任务并一键重试。"""
+        state_path = os.path.join(self.cfg.outdir, "_job_state.json")
+        try:
+            self.state.dump_state(state_path)
+            self.state.save_seen(os.path.join(self.cfg.outdir, "_seen_web.json"))
+        except Exception:
+            return
+        try:
+            with open(os.path.join(log_dir(), "_last_job.txt"), "w", encoding="utf-8") as f:
+                f.write(state_path)
+        except OSError:
+            pass
 
     def _kill_ffmpeg(self) -> None:
         self.hls.kill_ffmpeg()
 
+    def request_stop(self) -> None:
+        """用户点“停止”：立刻打断 ffmpeg 并取消在跑的视频协程（可从其它线程调用）。"""
+        self.ev.set()
+        self.hls.kill_ffmpeg()
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self._cancel_tasks(list(self._tasks)), loop)
+            except Exception:
+                pass
+
     def dispose(self) -> None:
-        """任务对象被新任务替换时回收后台资源（日志线程、残留 ffmpeg）。"""
+        """任务对象被新任务替换时回收后台资源（日志线程、残留 ffmpeg）。
+
+        先等上一个任务把浏览器/httpx/日志收尾做完（最多 10 秒），避免两个任务
+        抢同一份资源；超时也继续回收，不让 /api/start 卡死。
+        """
+        self._closed_event.wait(10)
         self.hls.kill_ffmpeg()
         try:
             self._logw.close()
@@ -309,19 +393,21 @@ class Job:
 
     def shutdown(self) -> None:
         """进程退出/优雅停机：停信号 + 杀 ffmpeg + 关浏览器，可从其它线程调用。"""
+        self._shutdown.set()
         self.ev.set()
         self.hls.kill_ffmpeg()
         loop = self._loop
         if loop is not None and loop.is_running() and self.browser.active:
             try:
                 fut = asyncio.run_coroutine_threadsafe(self.browser.close(), loop)
-                fut.result(timeout=8)
+                fut.result(timeout=6)
             except Exception:
                 pass
         try:
             self._logw.close()
         except Exception:
             pass
+        self._closed_event.set()
 
     # ---------- 任务控制 ----------
     @staticmethod
@@ -342,8 +428,10 @@ class Job:
             await self._cancel_tasks(tasks)
             raise
 
-    def retry_failed(self) -> tuple[int, str]:
-        pairs, err = self.state.prepare_retry()
+    def retry_failed(self, only: list[int] | None = None) -> tuple[int, str]:
+        if self._shutdown.is_set():
+            return 0, "服务正在停机，请重启后再重试"
+        pairs, err = self.state.prepare_retry(only)
         if err:
             return 0, err
         self.ev.clear()
@@ -352,7 +440,21 @@ class Job:
         return len(pairs), ""
 
     def _retry_thread(self, pairs: list[tuple[int, VideoItem]]) -> None:
-        asyncio.run(self._retry_run(pairs))
+        try:
+            asyncio.run(self._retry_run(pairs))
+        except BaseException as e:  # noqa: BLE001 - 兜底：线程异常不能让任务永远 running
+            try:
+                with self.state.lock:
+                    self.st["error"] = f"重试异常: {type(e).__name__}: {e}"
+                dbg_log(os.path.join(log_dir(), "_server_dbg.log"), "RETRY FATAL:\n" + traceback.format_exc())
+                self.state.finish(error=True)
+            except Exception:
+                pass
+            try:
+                self._logw.flush()
+            except Exception:
+                pass
+            self._closed_event.set()
 
     async def _retry_run(self, pairs: list[tuple[int, VideoItem]]) -> None:
         self._init_async()

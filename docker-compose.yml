@@ -31,6 +31,13 @@ services:
       # 状态目录重定向到镜像内路径: 查重用的 AI 组件已烘焙在那里(见 Dockerfile),
       # 运行时只读不写, 所以不需要挂卷, 容器重建也不会丢。
       - XDG_STATE_HOME=/opt/vdf-state
+      # ---- 可选安全基线（需要时取消注释） ----
+      # - YS_TOKEN=change-me                 # 设置后 /api/* 需要 X-API-Token（/api/health 除外）
+      # - YS_ALLOWED_ROOTS=/downloads        # 限制可写/可扫描目录（多个用系统路径分隔符）
+      # - YS_BLOCK_PRIVATE_MEDIA=1           # 拒绝播放列表指向私网/回环地址（防 SSRF）
+      # ---- 可选功能（需要时取消注释） ----
+      # - YS_RATE_RPS=5                      # 每 host 每秒请求上限（0=不限速）
+      # - YS_ALLOW_NO_ENDLIST=0              # 1=允许下载缺 ENDLIST 的直播/滚动窗口
     volumes:
       # 代码挂载: 改代码即时生效, 配合 --reload 热重载
       - .:/ys_web
@@ -39,9 +46,10 @@ services:
       - uv-cache:/uv-cache
       # 下载输出目录（映射到宿主机，容器销毁不丢失）
       - ./downloads:/downloads
-    # 启动时: 增量同步依赖(有变化才装) → 热重载启动
+    # 启动时: 增量同步依赖(有变化才装) → 启动服务
+    # 生产不再带 --reload：代码热重载会重启 worker，正在跑的任务/浏览器会被打断。
     # 加/改依赖后 docker compose restart 即可; 浏览器用镜像里预装的 Playwright chromium
-    command: sh -c "uv sync --no-dev && uv run uvicorn main:app --host 0.0.0.0 --port 8765 --reload"
+    command: sh -c "uv sync --no-dev && uv run uvicorn main:app --host 0.0.0.0 --port 8765"
     restart: unless-stopped
 
 volumes:

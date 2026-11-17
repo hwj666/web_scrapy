@@ -1,4 +1,5 @@
-"""通用静态播放页解析解析器：多形态解码 → m3u8 → maccms 加密 blob 试解 → iframe 递归。"""
+"""通用静态播放页解析器：多形态解码 → m3u8 → maccms 加密 blob 试解 → iframe 递归。"""
+
 from __future__ import annotations
 
 import base64
@@ -51,8 +52,7 @@ class StaticResolver(Resolver):
             mu = self._pick_m3u8(t)
             if mu:
                 name = self._extract_vod_name(t)
-                return ResolvedVideo(m3u8_url=self._abs(mu, url),
-                                     title=name or self._title(text))
+                return ResolvedVideo(m3u8_url=self._abs(mu, url), title=name or self._title(text))
         m = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', text, re.I)
         if m:
             src = self._abs(m.group(1), url)
@@ -147,13 +147,19 @@ class StaticResolver(Resolver):
             except Exception:
                 continue
             for ks in keys:
-                for key in (hashlib.sha256(ks.encode()).digest(), ks.encode(),
-                            hashlib.md5(ks.encode()).digest()):
+                for key in (
+                    hashlib.sha256(ks.encode()).digest(),
+                    ks.encode(),
+                    hashlib.md5(ks.encode()).digest(),
+                ):
                     if len(key) not in (16, 24, 32):
                         continue
-                    for mode, kw in ((AES.MODE_ECB, {}), (AES.MODE_CBC, {"iv": b"\0" * 16})):
+                    for iv in (None, b"\0" * 16):
                         try:
-                            pt = unpad_pkcs7(AES.new(key, mode, **kw).decrypt(raw))
+                            if iv is None:
+                                pt = unpad_pkcs7(AES.new(key, AES.MODE_ECB).decrypt(raw))
+                            else:
+                                pt = unpad_pkcs7(AES.new(key, AES.MODE_CBC, iv).decrypt(raw))
                             t = pt.decode("utf-8", "ignore")
                             if "m3u8" in t or "vod_name" in t:
                                 return t

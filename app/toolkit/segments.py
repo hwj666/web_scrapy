@@ -1,4 +1,5 @@
 """分片落盘 / 解密合并（纯 IO + 加密，不依赖 Job）。"""
+
 from __future__ import annotations
 
 import os
@@ -17,8 +18,7 @@ def save_segment(path: str, data: bytes) -> None:
     os.replace(tmp, path)
 
 
-def concat_segments(ts: str, parts: str, count: int, keys: list[bytes | None],
-                    ivs: list[bytes]) -> None:
+def concat_segments(ts: str, parts: str, count: int, keys: list[bytes | None], ivs: list[bytes]) -> None:
     """按顺序解密并合并分片（阻塞 IO，调用方用 asyncio.to_thread 跑）。
 
     每个分片各自一条 CBC 链：key 可以逐片不同（密钥轮换），IV 也可以逐片不同

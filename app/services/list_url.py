@@ -8,6 +8,7 @@
 
 候选数量有上限，避免 404 时把站点扫一遍。
 """
+
 from __future__ import annotations
 
 import re
@@ -15,11 +16,11 @@ from urllib.parse import urljoin, urlsplit
 
 PAGE_TOKEN = "{}"
 _NUM_RE = re.compile(r"\d+")
+# query 里已有的分页参数：模板化时改值，不要追加出 &page=2&page={}
+_PAGE_Q_RE = re.compile(r"(^|[?&])(page|paged|pageNum|page_no|p)=\d+", re.I)
 _HREF_RE = re.compile(r'href=["\']([^"\'#]+)["\']', re.I)
 # 常见的分类列表路由前缀（出现过的前缀优先于盲猜模板）
-_ROUTE_RE = re.compile(
-    r"/(?:vodtype|vodshow|vodlist|vod|type|list|show|category|index\.php/vod/type)/",
-    re.I)
+_ROUTE_RE = re.compile(r"/(?:vodtype|vodshow|vodlist|vod|type|list|show|category|index\.php/vod/type)/", re.I)
 # 详情/播放路由绝不能被当成列表路径
 _DETAIL_RE = re.compile(r"/(?:play|vodplay|detail|voddetail|watch)/", re.I)
 MAX_CANDIDATES = 12
@@ -58,8 +59,7 @@ def _with_page(pattern: str) -> str:
     return f"{pattern}{sep}page={PAGE_TOKEN}"
 
 
-def candidate_templates(tpl: str,
-                        patterns: tuple[str, ...] = DEFAULT_PATTERNS) -> list[str]:
+def candidate_templates(tpl: str, patterns: tuple[str, ...] = DEFAULT_PATTERNS) -> list[str]:
     """按分类 id 生成候选列表模板（绝对地址，按原顺序去重）。"""
     origin = _origin(tpl)
     cat = category_id(tpl)
@@ -86,9 +86,13 @@ def templates_from_url(url: str, cat: str) -> list[str]:
         last = nums[-1]
         # 只有「最后一个数字不是分类号」时才能安全地把它换成分页占位符
         if last.group(0) != cat or len(nums) > 1:
-            out.append(f"{origin}{path[:last.start()]}{PAGE_TOKEN}{path[last.end():]}")
+            out.append(f"{origin}{path[: last.start()]}{PAGE_TOKEN}{path[last.end() :]}")
     if up.query:
-        out.append(f"{origin}{path}?{up.query}&page={PAGE_TOKEN}")
+        if _PAGE_Q_RE.search(up.query):
+            query = _PAGE_Q_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}={PAGE_TOKEN}", up.query, count=1)
+            out.append(f"{origin}{path}?{query}")
+        else:
+            out.append(f"{origin}{path}?{up.query}&page={PAGE_TOKEN}")
     else:
         out.append(f"{origin}{path}?page={PAGE_TOKEN}")
     return list(dict.fromkeys(out))
@@ -130,10 +134,13 @@ def templates_from_homepage(html: str, base_url: str, cat: str) -> list[str]:
     out: list[str] = []
 
     # 只认「像分类列表」的链接：详情/播放路由一律排除
-    list_links = [ln for ln in links
-                  if urlsplit(ln).netloc == urlsplit(origin).netloc
-                  and _ROUTE_RE.search(urlsplit(ln).path)
-                  and not _DETAIL_RE.search(urlsplit(ln).path)]
+    list_links = [
+        ln
+        for ln in links
+        if urlsplit(ln).netloc == urlsplit(origin).netloc
+        and _ROUTE_RE.search(urlsplit(ln).path)
+        and not _DETAIL_RE.search(urlsplit(ln).path)
+    ]
 
     # 1) 直接带分类 id 的链接（最可靠：站点自己写出来的列表地址）
     if cat:
@@ -167,8 +174,7 @@ def urls_in_html(html: str) -> list[str]:
     return out
 
 
-_ASSET_RE = re.compile(
-    r"\.(?:js|css|png|jpe?g|gif|ico|svg|woff2?|ttf|mp4|m3u8|map)$", re.I)
+_ASSET_RE = re.compile(r"\.(?:js|css|png|jpe?g|gif|ico|svg|woff2?|ttf|mp4|m3u8|map)$", re.I)
 _ASSET_PATH_RE = re.compile(r"/(?:logo|assets?|static|gg-|ads?)/", re.I)
 
 
@@ -186,9 +192,11 @@ def pick_chain_host(html: str, exclude_hosts: set[str]) -> str:
     blocked = {h.lower() for h in exclude_hosts if h}
     urls = [u for u in urls_in_html(html) if not _is_asset_url(u)]
     # 优先「入口页」：根路径或 /home.html 之类
-    entry = [u for u in urls
-             if not urlsplit(u).path.strip("/") or
-             urlsplit(u).path.lower().endswith(("/home.html", "/index.html"))]
+    entry = [
+        u
+        for u in urls
+        if not urlsplit(u).path.strip("/") or urlsplit(u).path.lower().endswith(("/home.html", "/index.html"))
+    ]
     for group in (entry, urls):
         for url in group:
             host = urlsplit(url).netloc.lower().split(":")[0]
@@ -223,8 +231,7 @@ def pick_link_for_host(links: list[str], host: str, cat: str) -> str:
     详情/播放链接一律排除。
     """
     target = (host or "").lower()
-    pool = [ln for ln in links
-            if urlsplit(ln).netloc.lower().split(":")[0] == target]
+    pool = [ln for ln in links if urlsplit(ln).netloc.lower().split(":")[0] == target]
     pool = [ln for ln in pool if not is_detail_path(ln)]
     if not pool:
         return ""
@@ -246,7 +253,7 @@ def scheme_variants(tpl: str) -> list[str]:
     if not tpl:
         return []
     if tpl.startswith("https://"):
-        return ["http://" + tpl[len("https://"):]]
+        return ["http://" + tpl[len("https://") :]]
     if tpl.startswith("http://"):
-        return ["https://" + tpl[len("http://"):]]
+        return ["https://" + tpl[len("http://") :]]
     return []

@@ -134,6 +134,7 @@ pre#dupOut{max-height:220px;overflow:auto;font:11.5px/1.7 Consolas,monospace;col
 <div class="bar-wrap"><div class="bar" id="bar"></div></div>
 <div class="meta-row" id="metaRow" aria-live="polite">等待任务…</div>
 <div class="meta-row" id="jobCfg" style="display:none"></div>
+<div class="meta-row warn-row" id="warnRow" style="display:none;color:var(--warn,#d08c00)"></div>
 
 <section class="panel">
   <div class="p-title">⚙️ 任务设置</div>
@@ -146,6 +147,7 @@ pre#dupOut{max-height:220px;overflow:auto;font:11.5px/1.7 Consolas,monospace;col
       <option>1</option><option selected>2</option><option>3</option><option>4</option></select></div>
     <div class="field"><label for="f_segs">分片并发</label><input id="f_segs" type="number" value="8" min="1" max="24" step="1"></div>
     <div class="field"><label for="dupPct">查重相似度 %</label><input id="dupPct" type="number" value="96" min="50" max="100" step="1"></div>
+    <div class="field"><label for="f_onlynew">增量下载</label><label class="mini"><input type="checkbox" id="f_onlynew"> 只下历史清单里没有的新视频</label></div>
   </div>
 </section>
 
@@ -214,6 +216,7 @@ pre#dupOut{max-height:220px;overflow:auto;font:11.5px/1.7 Consolas,monospace;col
     </select></div>
     <button id="dupApply" disabled>🧹 执行清理</button>
   </div>
+  <div class="help">安全门禁：永久删除前必须先用同一策略执行一次「仅预览，不删除」（10 分钟内有效）；清理前会校验文件大小/修改时间，扫描后被替换的文件不会被删。</div>
   <div class="help" id="dupApplyInfo" style="margin-bottom:4px"></div>
   <pre id="dupOut" style="display:none"></pre>
 </section>
@@ -222,7 +225,7 @@ pre#dupOut{max-height:220px;overflow:auto;font:11.5px/1.7 Consolas,monospace;col
 
 <script>
 const $ = s => document.querySelector(s);
-const FIELDS = ["f_url","f_p1","f_p2","f_out","f_workers","f_segs"];
+const FIELDS = ["f_url","f_p1","f_p2","f_out","f_workers","f_segs","f_onlynew"];
 const SAVED = FIELDS.concat(["dupPct"]);   // dupPct 也要记住, 但不随任务运行禁用
 let lastLogSeq = 0, running = false, emptyState = false;
 const MAX_LOG_LINES = 800;   // DOM 里只留最近 N 行, 长任务不会把页面拖慢
@@ -244,12 +247,15 @@ function vChips(v){
 }
 
 function vRow(v){
+  const canRetry = !running && (v.s===3 || v.s===0);
   return `<div class="vrow${v.s===1?" run":""}${v.s===3?" fail":""}" id="vr-${v.i}">`
     +`<span class="v-i">${v.i}</span>`
     +`<span class="v-t">`+(v.u?`<a class="v-link" href="${esc(v.u)}" target="_blank" rel="noopener" title="${esc(v.u)}">${esc(v.t)}</a>`:esc(v.t))+`</span>`
     +`<span class="v-steps">${vChips(v)}</span>`
     +(v.s===3?`<span class="v-e" title="${esc(v.e)}">${esc(v.e||"")}</span>`:"")
-    +`<span class="v-r ${S_CLS[v.s]||""}">${S_NAME[v.s]||"-"}</span></div>`;
+    +`<span class="v-r ${S_CLS[v.s]||""}">${S_NAME[v.s]||"-"}</span>`
+    +(canRetry?`<button class="mini r-retry" data-i="${v.i}" title="只重试这一条">↻</button>`:"")
+    +`</div>`;
 }
 
 function renderVList(vids){
@@ -285,8 +291,8 @@ function renderVideos(j){
   }
 }
 
-function saveCfg(){const o={};SAVED.forEach(id=>{if($("#"+id))o[id]=$("#"+id).value;});localStorage.setItem("ys_cfg",JSON.stringify(o));}
-function loadCfg(){try{const o=JSON.parse(localStorage.getItem("ys_cfg")||"{}");for(const k in o)if($("#"+k))$("#"+k).value=o[k];}catch(e){}}
+function saveCfg(){const o={};SAVED.forEach(id=>{const el=$("#"+id);if(el)o[id]=el.type==="checkbox"?el.checked:el.value;});localStorage.setItem("ys_cfg",JSON.stringify(o));}
+function loadCfg(){try{const o=JSON.parse(localStorage.getItem("ys_cfg")||"{}");for(const k in o){const el=$("#"+k);if(!el)continue;if(el.type==="checkbox")el.checked=!!o[k];else el.value=o[k];}}catch(e){}}
 
 function render(j){
   const pill=$("#pill");
@@ -321,6 +327,17 @@ function render(j){
   pill.textContent = j.error?"出错":j.running?"运行中":j.stopped?"已停止":"已完成";
   pill.className = "pill "+(j.error?"err":j.running?"run":j.stopped?"stop":"ok");
 
+  // 非致命警告（列表页抓取失败、直播流跳过、成品校验未通过等）
+  const wr=$("#warnRow");
+  const warns=(j.warnings||[]).slice();
+  const failedPages=(st.list && st.list.failed_pages) || [];
+  if(warns.length || failedPages.length){
+    if(failedPages.length && !warns.some(w=>String(w).includes("抓取失败"))){
+      warns.unshift(`列表第 ${failedPages.join("、")} 页抓取失败，任务可能漏抓，建议补跑`);
+    }
+    wr.style.display=""; wr.textContent="⚠️ "+warns.join("；");
+  }else{ wr.style.display="none"; wr.textContent=""; }
+
   const c=j.config;
   // 任务摘要显示在顶部 jobCfg 行, 配置输入框常驻可改
   $("#jobCfg").style.display="";
@@ -332,6 +349,7 @@ function render(j){
   const ls=$("#listStat");
   if(ls) ls.textContent = st.list.status==="idle" ? "" :
     `已解析 ${st.list.pages}/${st.list.pages_total} 页 · 共 ${st.list.found} 个视频` +
+    (st.list.failed ? ` · ${st.list.failed} 页失败` : "") +
     (st.list.status==="running" ? " · 解析中…" : "");
   renderVideos(j);
 
@@ -423,9 +441,11 @@ async function runPipeline(){
   const body={list_url:$("#f_url").value.trim(),
     p1:+$("#f_p1").value,p2:+$("#f_p2").value,outdir:$("#f_out").value,
     workers:+$("#f_workers").value,
-    seg_concurrency:+$("#f_segs").value};
+    seg_concurrency:+$("#f_segs").value,
+    only_new:$("#f_onlynew").checked};
   const r=await api("/api/start",body);
   if(!r.ok) return toast(r.error||"启动失败",true);
+  if(r.warning) toast("提示："+r.warning,true);
   $("#log").textContent=""; lastLogSeq=0;
   toast("流水线已启动");
   setTimeout(tick,300);
@@ -444,6 +464,18 @@ $("#btnRetry").onclick=async()=>{
   toast(`已重新派发 ${r.count} 个失败视频`);
   setTimeout(tick,300);
 };
+
+// 单条重试：失败清单里点 ↻ 只重派这一条
+$("#vlist").addEventListener("click",async(ev)=>{
+  const btn=ev.target.closest(".r-retry");
+  if(!btn) return;
+  const i=+btn.dataset.i;
+  btn.disabled=true;
+  const r=await api("/api/retry_video",{i});
+  if(!r.ok){ btn.disabled=false; return toast(r.error||"重试失败",true); }
+  toast(`已重试第 ${i} 条`);
+  setTimeout(tick,300);
+});
 
 loadCfg();
 document.addEventListener("visibilitychange",()=>{ if(!document.hidden) tick(); });
@@ -724,6 +756,12 @@ tick();
       const sTxt = selS.selectedOptions[0] ? selS.selectedOptions[0].textContent : strategy;
       const mTxt = selM.selectedOptions[0] ? selM.selectedOptions[0].textContent : mode;
       if(mode !== "dry-run"){
+        const la = D.st && D.st.last_apply;
+        if(!la || la.mode !== "dry-run" || la.strategy !== strategy
+           || (Date.now()/1000 - (la.at||0)) > 600){
+          toast("永久删除前请先执行一次「仅预览，不删除」（同一策略，10 分钟内有效）", true);
+          return;
+        }
         if(!confirm(`确认清理重复视频？\n\n策略：${sTxt}\n模式：${mTxt}\n\n非预览模式会按 VDF 结果处理重复文件，请确认策略无误。`)) return;
       }
       D.busy = true;

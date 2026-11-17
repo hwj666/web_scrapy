@@ -28,21 +28,24 @@
 | `app/services/video_worker.py` | **单视频 `VideoWorker`**：播放页解析、下载、重试、跳过、失败记录 |
 | `app/services/hls.py` | **HLS 下载器 `HlsDownloader`**：密钥/IV、分片池、解密合并、ffmpeg |
 | `app/services/browser.py` | **浏览器会话 `BrowserSession`**：Playwright 启动、上下文复用、页面借还 |
-| `app/services/domain.py` | **域名探测 `DomainProbe`**：直连/30x/CNAME/发布页跳转、运行期重探 |
-| `app/services/dedup_service.py` | VDF 查重与清理状态机 `DedupService` |
-| `app/toolkit/` | 工具：`codec` / `files`（文件与异步日志）/ `http` / `m3u8` / `segments` / `title` / `url` / `dns` |
-| `tests/` | 单测（纯函数 + Job 状态机）与端到端加密 HLS 实测 |
+| `app/services/domain.py` | **域名探测 `DomainProbe`**：直连/30x/CNAME/发布页跳转、运行期重探；播放页提示的新域名需能打开列表页才采纳 |
+| `app/services/dedup_service.py` | VDF 查重与清理状态机 `DedupService`（永久删除有 dry-run 门禁 + 文件未变化校验） |
+| `app/toolkit/` | 工具：`codec` / `files`（文件与异步日志）/ `http`（限速+私网拦截）/ `m3u8` / `segments` / `probe`（ffprobe 成品校验）/ `title` / `url` / `dns` |
+| `tests/` | 单测（纯函数 + Job 状态机 + 列表失败页 + HLS 完整性 + 查重安全门禁 + 持久化）与端到端加密 HLS 实测 |
 | `Dockerfile` / `docker-compose.yml` | 镜像：系统 ffmpeg、VDF CLI、预置 AI 组件、chromium |
+| `.github/workflows/ci.yml` | CI：ruff check / ruff format --check / mypy / pytest |
 
 运行期产物：
 
 - 输出目录 `<outdir>/`（默认 `OUTDIR` 或仓库根 `downloads/`）
-  - `NNN_标题.mp4` — 成品
+  - `NNN_标题.mp4` — 成品（写完先用 ffprobe/ffmpeg 校验容器与时长，坏片会删掉重试）
   - `NNN_标题.mp4.tmp` — ffmpeg 合成中的临时成品；成功后 `os.replace` 原子改名，
     失败/停止时删除（避免把半截 MP4 误判为已完成）
   - `NNN_标题.tmp.ts` — 解密合并中的中间流；失败时保留为 `.ts` 便于手工转封装
-  - `NNN_标题.tmp.ts.parts/` — 分片缓存（断点续传用，成功后删除）
+  - `NNN_标题.tmp.ts.parts/` — 分片缓存（断点续传用，成功后删除；指纹含域名/媒体序列号/ENDLIST）
   - `manifest_web.json` — 本次解析出的视频清单
+  - `_job_state.json` — 任务状态快照（进程重启后界面仍能展示上次任务，并支持一键重试）
+  - `_seen_web.json` — 历史已下载清单（「增量下载」勾选后只下清单外的新视频）
   - `_web_log.txt` — 任务日志（追加写，超过 5MB 自动轮转为 `.1`）
   - `_failed_web.txt` — 失败清单（供人工排查/导入；「一键重试」用的是内存里的任务状态）
   - `_vdf_results.json` / `_vdf_db/` — 查重结果与 VDF 帧哈希库
@@ -107,7 +110,7 @@ flowchart TD
 
 | 阶段 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `list` | `pages/pages_total/found` | 列表页解析进度 |
+| `list` | `pages/pages_total/found/failed/failed_pages` | 列表页解析进度；抓取失败的页单独计数，不会当成“空页”提前收工 |
 | `play` | `resolved/total` | 播放页解析成功数 |
 | `key` | `got/method/iv` | 密钥获取数、加密方式、IV 前缀 |
 | `seg` | `done/skip/current` | 已完成分片总数、跳过数、当前视频 |
@@ -115,6 +118,9 @@ flowchart TD
 | `out` | `count/gb/recent` | 产出数量、总体积、最近 8 条 |
 
 进度条两段拼成：列表阶段 `2%~10%`，下载阶段 `10%~98%`（按 `ok+fail+skip/total`）。
+
+快照里还有 `warnings`（非致命警告：列表页抓取失败、直播流被跳过、成品校验未通过等），
+前端显示在进度条下方；`failed_pages` 也随 `/api/job` 快照返回。
 
 ### 3.4 查重状态 `DedupService.st`
 
@@ -157,14 +163,24 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
 ### 4.4 下载与合成
 
 - `resolve_playlist` 最多下钻 3 层 master 列表，取 BANDWIDTH 最高档。
+- **缺少 `#EXT-X-ENDLIST` 的播放列表默认拒绝**（直播/滚动窗口只下当前窗口会被当成完整
+  视频永久跳过）；确需下载当前窗口时设 `YS_ALLOW_NO_ENDLIST=1`。
+- **成品校验**：MP4 落盘后用 ffprobe（缺失时退回 `ffmpeg -i`）确认容器与时长，
+  坏片删除并重试；`YS_VERIFY_MP4=0` 可关闭。
+- **分片内容校验**：加密分片要求长度是 AES 块整数倍，明文分片要求首字节是 TS 同步字节，
+  返回 HTML 错误页/空响应的分片直接判失败，不再落盘成“合法缓存”。
 - `key_schedule` 按分片解析 `#EXT-X-KEY`（属性顺序无关、支持引号内逗号），支持：
   - **密钥轮换**（多个不同 URI 的 KEY，逐片切换）；
   - **中途转明文**（`METHOD=NONE`）；
   - 没有显式 IV 时按 RFC 8216 用**媒体序列号**派生每片 IV（不再全用 0 IV）。
-- 分片用固定数量的下载协程消费下标（任务级共享线程池，先写唯一临时文件再
-  `os.replace` 原子改名），几千片也不会瞬间创建几千个 Task。
-- 每片单独 AES-128-CBC 解密（各自 PKCS7），顺序写入 `.tmp.ts`。
-- `ffmpeg -c copy -movflags +faststart` 转封装（30 分钟超时），失败保留 `.ts`。
+- 分片用固定数量的下载协程消费下标（任务级共享线程池 + **全局 `seg_concurrency` 信号量**，
+  所有在跑视频共享总并发，不再按 workers 整除放大），几千片也不会瞬间创建几千个 Task。
+- 每片单独 AES-128-CBC 解密（各自 PKCS7），顺序写入 `.tmp.ts`；解密/合并失败会丢弃分片缓存，
+  避免每次重试复放同一批坏片；合并流要求首尾都落在 188 字节包边界上。
+- 分片缓存指纹 = 分片路径 + 密钥内容 + IV + **来源 host + `EXT-X-MEDIA-SEQUENCE` + ENDLIST**，
+  换域名/换一轮直播后不会把两次内容拼成一条流。
+- `ffmpeg -c copy -movflags +faststart` 转封装（30 分钟超时，**轮询停止信号，点停止 0.5 秒内杀进程**），
+  失败保留 `.ts`。
 
 ### 4.5 容错、重试与域名变化
 
@@ -174,7 +190,9 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
 | 单视频 | 3（域名重探成功 +1） | 可重试错误 | 重新解析播放页；连不上先域名重探 |
 | 标题预解析 | 2 | 列表页没拿到标题 | 先解析播放页取标题再判断跳过 |
 | 熔断 | - | 连续 5 个失败 | 中止任务（成功一次清零计数） |
-| 一键重试 | 手动 | 任务已结束 | 复位 `s=3` 与 `s=0` 重新派发 |
+| 列表页 | 2（失败后降并发） | WAF/限流/解析失败 | 记为 `failed_pages` + warning，继续翻其他页，**不再当成“空页”提前收工** |
+| 停止 | 立即 | `/api/stop` | 置停止信号 + 杀 ffmpeg + 取消在跑协程；收尾标记「已停止」而不是 100% 完成 |
+| 一键重试 | 手动 | 任务已结束/进程重启后 | 复位 `s=3` 与 `s=0` 重新派发；支持失败清单里**单条重试** |
 
 - **不可重试**：`pipeline_rules.yaml` 里的 `non_retryable` 关键词（找不到 m3u8、404、磁盘满、
   ffmpeg 失败、不支持的加密方式等）直接判失败。
@@ -185,10 +203,16 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
   `publish_click_texts`；同时监听当前页打开的新标签页/弹窗，从新页面 URL 或
   “最新地址/新域名: xxx”文字里识别 host，切换整个任务的 base，并把已入队的旧域名 URL
   重写到新域名后重试当前视频。
+- **发布页只写一行新地址也能跟随**：`xxxx → yyyy（说明页）→ zzzz（新站）` 这种多跳链路，
+  会同时探测**列表页本身和首页**（发布提示常挂在列表页上，首页可能已 404），最多跟 5 跳；
+  说明页只有一行新地址、既没有“新域名”等关键词也没有链接时，会扫描正文里的域名候选
+  （支持 `zzzz。com` / `zzzz点com` 这类写法），逐个用「能否打开列表页」验证后再采纳，
+  同域/裸 IP/广告统计 CDN 域名一律过滤；旧列表页返回 200 但只是空壳说明页时也会触发。
 - **列表路径修复**：换域名时只换 host 会保留旧路径，而站点经常连列表路由一起改版。
   拿到新域名后会先校验列表页，不可用时按可信度依次探测：
-  1. **跟随跳转链**：`旧域名 → 跳转/说明页 → 页面上写的新网址`（最多 3 跳，
-     HTTP 跳转、页面文字“最新网址/新域名: …”、页面链接都认；JS 渲染的说明页会用浏览器再读一次）；
+  1. **跟随跳转链**：`旧域名 → 跳转/说明页 → 页面上写的新网址`（最多 5 跳，
+     HTTP 跳转、页面文字“最新网址/新域名: …”、正文裸域名、页面链接都认；
+     JS 渲染的说明页会用浏览器再读一次）；
   2. 发布页/弹窗里给出的新站点链接（优先带原分类 id 的列表页）；
   3. 新域名首页自己的分类链接与列表路由前缀；
   4. `list_url_patterns` 常见路由（`/vodtype/{cat}-{page}.html`、
@@ -206,6 +230,34 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
   m3u8、重新解析播放页（`.parts` 缓存按指纹决定续传或清空）。
 - **列表页并发**：按 `pipeline.list_concurrency`（默认 3）同时抓取/解析多页，但结果仍按页码
   顺序入队，视频编号与日志顺序不变；连续两页无新增时取消窗口内剩余请求提前收工。
+- **列表页失败不再静默**：单页失败会退避重试一次，仍失败则记录页码、降低后续并发、写入
+  `warnings` 与快照里的 `failed_pages`，并在任务结束时汇总提示补跑；只有“解析成功但内容为空”的页
+  才会参与“已到分类末尾”判断（连续 3 页全重复内容才算末尾）。
+- **URL 翻页无效时自动改点“下一页”**：有些站点忽略 `page=` 参数，或纯 JS 换内容但地址不变，
+  第 2 页起会解析出与前面相同的内容或空页。检测到后自动改用浏览器：
+  先点 `next_page_selector` / `next_page_texts` 命中的「下一页/加载更多」（含按文字/aria-label 兜底），
+  没有翻页按钮时再尝试滚到底触发无限滚动/下拉加载；按逻辑页码继续采集，只触发一次，
+  仍然拿不到新条目就按正常逻辑收尾。
+
+### 4.6 翻页链接、增量、持久化与安全
+
+- **翻页链接**：`{}`/`{p}`/`{page}`/`%d` > query 里的 `page=…` > 路径数字。
+  单页任务（起始页=结束页）直接使用用户粘贴的地址，所以 `/vodtype/144.html` 不会被改写成
+  `/vodtype/1.html`；多页任务但链接既没有占位符也没有 page 参数时，启动响应会带 `warning`
+  提示改写成 `?page={}`，避免把分类 ID 当页码。
+- **增量下载**：勾选「只下历史清单里没有的新视频」后，命中的条目直接跳过；成功/跳过都会写入
+  `<outdir>/_seen_web.json`。配合 cron 每天跑一次即可当追更用。
+- **任务持久化**：任务结束（完成/出错/停止）时写 `<outdir>/_job_state.json` 与
+  `_logs/_last_job.txt`；服务重启后 `/api/job` 仍返回上次任务，`/api/retry_failed` 可直接重试。
+  不会自动续跑（避免重启即抢占带宽）。
+- **安全基线（可选，默认不改变原有行为）**：
+  - `YS_TOKEN`：设置后除 `/api/health` 外所有 `/api/*` 需要 `X-API-Token` 头；
+  - `YS_ALLOWED_ROOTS`：限制输出目录/查重扫描目录必须落在这些根目录内（`os.path.realpath` 校验）；
+  - `YS_BLOCK_PRIVATE_MEDIA=1`：拒绝播放列表/密钥/分片指向私网、回环、链路本地地址（SSRF 防护）；
+  - `YS_RATE_RPS`：按 host 限制每秒请求数（默认 0 不限速）；
+  - TLS 策略统一：`YS_TLS_VERIFY=0` 同时作用于 httpx、DoH/CNAME 探测与 Playwright 上下文；
+  - 查重「永久删除」必须先在 10 分钟内用同一策略成功执行一次 dry-run，且清理前校验文件
+    大小/mtime/realpath，扫描后被替换的文件不会被删。
 
 ---
 
@@ -217,18 +269,20 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
 | GET | `/api/health` | 健康检查（给 Docker healthcheck / 反代探活用） |
 | GET | `/api/job` | 任务状态快照；无任务返回 `{"empty": true}` |
 | GET | `/api/events` | 任务状态 SSE（状态未变化时不重复推送，15 秒心跳；断开自动退回轮询） |
-| POST | `/api/start` | `{list_url,p1,p2,outdir,workers}` 启动任务 |
-| POST | `/api/stop` | 请求停止当前任务 |
-| POST | `/api/retry_failed` | 重试失败/未完成视频，返回 `count` |
+| POST | `/api/start` | `{list_url,p1,p2,outdir,workers,seg_concurrency,only_new}` 启动任务；返回里带 `warning`（翻页链接可能不可靠时） |
+| POST | `/api/stop` | 立即停止当前任务（杀 ffmpeg + 取消在跑协程） |
+| POST | `/api/retry_failed` | 重试失败/未完成视频，返回 `count`；进程重启后可重试上次任务 |
+| POST | `/api/retry_video` | `{i}` 只重试第 i 条（失败清单单条重试） |
 | GET | `/api/dedup/status` | 查重进度、分组、可用性 |
 | POST | `/api/dedup/start` | `{dir,percent}` 启动扫描（下载任务运行中会被拒绝） |
 | POST | `/api/dedup/stop` | 停止扫描 |
 | POST | `/api/dedup/apply` | `{strategy,mode}` 执行清理（下载任务运行中会被拒绝） |
 
-> 下载与查重互斥：任务运行中不允许扫描/清理，扫描进行中也不允许启动/重试下载，
-> 避免 VDF 读到正在写入的 MP4。
+> 下载与查重互斥：任务运行中不允许扫描/清理，扫描/清理进行中也不允许启动/重试下载，
+> 避免 VDF 读到正在写入的 MP4、或清理删到正在下载的文件。
 
-> 接口没有鉴权且默认监听 `0.0.0.0`，只适合本机/内网使用。
+> 接口默认无鉴权；设置 `YS_TOKEN` 后除 `/api/health` 外都需要 `X-API-Token`。
+> 仍建议只在本机/内网使用，或放在带认证的反向代理后面。
 
 ---
 
@@ -242,7 +296,13 @@ h1 → JSON-LD name → `<title>` 拆段** 收集候选，再用「站名、页�
 | `YS_HOST` | `0.0.0.0` | 监听地址（`python main.py` / 直接读 AppConfig 时生效） |
 | `YS_PORT` | `8765` | 监听端口 |
 | `YS_LOG_DIR` | `<OUTDIR>/_logs` | 运行期日志目录（`_server_dbg.log` / `_faulthandler.log`） |
-| `YS_TLS_VERIFY` | 开 | 默认校验证书；设为 `0/false/no/off` 时关闭（兼容自签/证书异常站点） |
+| `YS_TLS_VERIFY` | 开 | 默认校验证书；设为 `0/false/no/off` 时关闭（同时作用于 httpx、DoH 探测与 Playwright 上下文） |
+| `YS_TOKEN` | 空 | 设置后 `/api/*`（除 `/api/health`）需要 `X-API-Token` 头 |
+| `YS_ALLOWED_ROOTS` | 空 | 可写/可扫描目录白名单（多个用系统路径分隔符），空表示不限制 |
+| `YS_BLOCK_PRIVATE_MEDIA` | 关 | 设为 `1` 时拒绝播放列表指向私网/回环/链路本地地址（SSRF 防护） |
+| `YS_RATE_RPS` | `0` | 每 host 每秒请求上限；0 表示不限速 |
+| `YS_VERIFY_MP4` | 开 | 成品 ffprobe 校验；设为 `0/false/no/off` 关闭 |
+| `YS_ALLOW_NO_ENDLIST` | 关 | 设为 `1` 才允许下载缺 `#EXT-X-ENDLIST` 的直播/滚动窗口 |
 | `VDF_BIN` | 自动找 PATH | 查重可执行文件路径 |
 | `VDF_SAMPLES` | `24` | 每视频采样帧数（1~200） |
 | `VDF_AI` | 开 | 设为 `0/false/no/off` 关闭 AI 匹配两阶段 |
@@ -285,8 +345,13 @@ uv run python -m pytest -q                          # pytest 配置在 pyproject
 - `test_job_logic.py`：分片解密合并（含轮换密钥、逐片 IV）、一键重试进度、列表页并发有序性、异步日志。
 - `test_modules.py`：拆分后的 JobState / DomainProbe / VideoWorker / 列表 API 兜底、
   HLS 缓存指纹与 TS 校验、分片失败触发域名恢复、epoch 中断在跑下载、发布页新域名识别
-  与 URL 重写、换域名后列表路径修复、TLS 默认值边界测试。
-- `test_domain_popup.py`：用假页面对象验证“播放页弹窗/新标签页提示新域名”的识别。
+  与 URL 重写、换域名后列表路径修复、TLS 默认值边界测试；另含列表页失败不再当空页、
+  HLS 完整性（缺 ENDLIST 拒绝/分片内容校验/换域名缓存失效）、查重 dry-run 门禁与
+  文件变化过滤、任务状态 dump/restore、单条重试、目录白名单等回归测试；
+  以及 URL 翻页无效时「点下一页/无限滚动」的兜底（含起始页 >1 只点不收集）用例，
+  还有 `xxxx→yyyy→zzzz` 多跳、正文裸域名单行说明页、200 空壳列表页的换域名链路用例。
+- `test_domain_popup.py`：用假页面对象验证“播放页弹窗/新标签页提示新域名”的识别，
+  以及发布页正文裸域名候选的提取（全角点/“点”写法、第三方域名过滤）。
 - `test_dedup.py`：VDF 结果解析、保留项标记、文件名匹配、扫描视频枚举。
 - `test_hls_integration.py`：现场用 ffmpeg 生成 AES-128 加密 HLS，起本地 HTTP 服务走完整
   `_hls_to_mp4` 链路；缺 ffmpeg/依赖时自动跳过。
@@ -296,13 +361,18 @@ uv run python -m pytest -q                          # pytest 配置在 pyproject
 ### 代码质量
 
 `pyproject.toml` 里已经配好 `[tool.ruff]` / `[tool.pytest.ini_options]` / `[tool.mypy]`，
-并把 pytest/ruff/mypy 放进 `[dependency-groups] dev`（`uv sync` 默认安装）：
+并把 pytest/ruff/mypy 放进 `[dependency-groups] dev`（`uv sync` 默认安装；具体版本由
+`uv.lock` 锁定，当前 ruff 0.17.5 / mypy 2.4.1 / pytest 9.2.0）：
 
 ```bash
-uv run ruff check .          # 当前零告警
-uv run mypy                  # 当前零错误
-uv run python -m pytest -q
+uv run ruff check .            # 当前零告警
+uv run ruff format --check .   # 当前全部已格式化
+uv run mypy                    # 当前零错误
+uv run python -m pytest -q     # 94 个测试全部通过
 ```
+
+`.github/workflows/ci.yml` 会在 push/PR 时跑上面四项；
+升级 ruff/mypy 后若新增告警，需要同步修代码或调整规则，别让 README 的“零告警”漂移。
 
 ---
 
@@ -329,19 +399,51 @@ uv run python -m pytest -q
    移动端与 reduced-motion 样式。
 10. **职责拆分**：`job.py` 从 1042 行降到约 340 行，只保留任务编排；状态、列表流水线、
     单视频 worker、HLS、浏览器、域名各自独立成模块，`Job` 对外接口保持不变。
+11. **停止即时生效**：`/api/stop` 现在会杀 ffmpeg、取消在跑协程，并在收尾时把状态标记为
+    「已停止」而不是 100% 完成；ffmpeg 改为 0.5 秒轮询停止信号，浏览器等待也逐段检查。
+12. **结果可信**：列表页失败不再被当成空页（记 `failed_pages` + warning、降并发、可补跑）；
+    缺 ENDLIST 的直播流默认拒绝；成品用 ffprobe 校验；解密/合并失败会丢弃分片缓存。
+13. **断点续传安全**：分片指纹加入 host / 媒体序列号 / ENDLIST；分片落盘前校验内容形态；
+    换域名或换一轮直播后不会复用旧分片。
+14. **清理安全**：查重永久删除有 dry-run 门禁，删除前校验文件 realpath/大小/mtime；
+    apply 纳入 busy 互斥，结果文件原子回写。
+15. **安全基线**：可选 Token 鉴权、目录白名单、私网地址拦截、按 host 限速；TLS 策略统一到
+    `YS_TLS_VERIFY`，DoH 改用可校验证书的域名端点；播放页提示的新域名必须能打开列表页才采纳。
+16. **任务可恢复 + 增量**：任务结束落盘 `_job_state.json`，重启后仍能展示与重试；
+    `_seen_web.json` + 「增量下载」支持 cron 追更。
+17. **工程化**：CI（ruff check / ruff format --check / mypy / pytest）、`ruff format`、
+    dev 版本锁定；compose 生产启动去掉 `--reload`。
+18. **URL 翻页无效兜底**：检测到 page 参数被忽略/纯 JS 换内容（第 2 页内容重复或为空）时，
+    自动切到浏览器点「下一页/加载更多」，没有按钮再尝试无限滚动，避免只下到第 1 页。
+19. **换域名链路增强**：同时探测列表页与首页；发布页只写一行裸域名（含全角点/“点”写法）
+    时逐个用列表页验证后采纳；旧列表页返回 200 空壳说明页也能触发跟随；跨域目录链接
+    不再被误当成“新站点”。
 
 ## 9. 已知限制
 
 - **fMP4（`#EXT-X-MAP` / `.m4s`）不支持**：现在会直接报「fMP4(EXT-X-MAP) 播放列表暂不支持」，
   不会再把几百个分片下完才在 ffmpeg 阶段报合成失败。
 - 分片按 TS 处理，`EXT-X-BYTERANGE` 不支持；SAMPLE-AES 不支持（会明确报错）。
-- 任务状态只在内存里，进程重启后一键重试不可用（`_failed_web.txt` 仍在）。
+- **缺 `#EXT-X-ENDLIST` 的直播/滚动窗口默认拒绝**（可用 `YS_ALLOW_NO_ENDLIST=1` 放行当前窗口）。
+- 任务状态只在**任务结束/重试结束时**落盘；进程被强杀（SIGKILL/断电）会丢失本轮进度，
+  但 `_failed_web.txt` 与输出目录里的成品仍在。
 - 查重依赖外部 `vdf` CLI；Windows 下需自行放置可执行文件。
-- 大列表全部保留在内存中，前端最多渲染 300 行。
+- 查重永久删除必须先 dry-run（10 分钟内有效）；扫描后被替换/改名的文件会被跳过。
+- 大列表全部保留在内存中，前端最多渲染 300 行；单任务仍只允许一个（多任务队列未实现）。
+- 翻页链接没有 `{}`/`page=` 时按“路径最后一个数字是页码”推断，多页任务会有 `warning` 提示；
+  站点用分类 ID 作为路径数字时请显式写 `?page={}`。
+- URL 翻页无效（page 参数被忽略/纯 JS 换内容）时会尝试浏览器点「下一页」或无限滚动兜底；
+  如果站点用的是自定义翻页控件/纯手势翻页，需要把选择器或按钮文字加进
+  `pipeline_rules.yaml` 的 `next_page_selector` / `next_page_texts`，否则兜底可能点不到。
+  无限滚动每页最多滚 4 次、每次等 1.2 秒，懒加载很慢的站点仍可能漏条目。
 - 换域名弹窗识别依赖页面出现“新域名/最新地址/发布页”等提示，或弹窗带 `opener`
   可关联到当前页；完全无提示的广告式跳转、`noopener` 弹窗不一定能识别。
+  播放页提示的新域名会先用列表页校验，打不开的不采纳。
 - 列表路径修复只覆盖 `list_url_patterns` 里的常见路由；站点用了很特殊的路径时
   需要把模板加进 YAML，或手工改任务里的列表链接。
 - 运行中强制重探仍只探测列表 URL / 候选域名；旧域名仍可访问、页面也没有任何换域名提示时，
   程序无法自动发现新站，需要把新域名填进候选链接或重新运行任务。
-- `.tmp.ts.parts/` 分片缓存有密钥/播放列表指纹校验，但不会自动过期；长期运行后仍建议手工清理。
+- 发布页把新地址做成**图片/视频/Canvas** 时无法识别（没有 OCR），需要在页面文字里出现域名
+  或链接，或手动把新域名填进候选链接。
+- `.tmp.ts.parts/` 分片缓存有指纹校验但不会自动过期；长期运行后仍建议手工清理。
+- `YS_BLOCK_PRIVATE_MEDIA` 默认关闭（内网/NAS 站点常是私网地址），需要面对不可信站点时再开。

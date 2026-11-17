@@ -16,6 +16,8 @@ dependencies = [
 
 [dependency-groups]
 # 开发/测试工具（uv sync 默认安装；生产可用 uv sync --no-dev 跳过）
+# 具体版本由 uv.lock 锁定（ruff 0.17.5 / mypy 2.4.1 / pytest 9.2.0），
+# 升级时需同步跑 ruff format / mypy，避免 README 的“零告警”再次漂移。
 dev = [
     "pytest>=8",
     "mypy",

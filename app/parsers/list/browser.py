@@ -1,12 +1,16 @@
-"""浏览器列表解析解析器（playwright 兜底）：JS 渲染后按几何位置配卡片与标题。"""
+"""浏览器列表解析器（playwright 兜底）：JS 渲染后按几何位置配卡片与标题。"""
+
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import urlparse
 
+from app.core.exceptions import JobAborted, StopJob
 from app.core.models import ListPage, VideoItem
 from app.core.parsing import ListParser, ParserContext
 from app.core.rules import RuleManager
+from app.toolkit.browser import goto_with_stop, wait_with_stop
 from app.toolkit.title import TitleCleaner
 from app.toolkit.url import abs_url
 
@@ -69,10 +73,43 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
   .forEach(e => { e.style.display='none'; e.style.pointerEvents='none'; });
 """
 
+    # 规则里的选择器没命中时，按文字/aria-label 找「下一页/加载更多」并点击。
+    # 只在 URL 翻页确认无效后作为兜底，避免误点普通导航里的“更多”。
+    _NEXT_JS = """() => {
+  const words = ['下一页','下一頁','下页','下頁','加载更多','加載更多','Load More','Next','next','›','»'];
+  const sel = 'a,button,[role=button],[class*=next],[class*=page],[class*=more]';
+  const cands = [...document.querySelectorAll(sel)];
+  const visible = el => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const usable = el => visible(el) && !el.disabled
+    && (el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+  const label = el => ((el.textContent || '') + ' '
+    + (el.getAttribute('aria-label') || '')).trim();
+  const inPager = el => !!el.closest(
+    '.pagination,.pager,.page-nav,.pg,[class*=pagination],[class*=pager],[class*=page-]');
+  const match = el => words.some(w => label(el) === w
+    || (w.length > 2 && label(el).includes(w)));
+  const hit = cands.find(el => usable(el) && inPager(el) && match(el))
+    || cands.find(el => usable(el) && match(el));
+  if (hit) { hit.click(); return true; }
+  return false;
+}"""
+
     def __init__(self, ctx: ParserContext | None = None):
         super().__init__(ctx)
         self.manager: RuleManager = (self.ctx.state or {}).get("rules") or RuleManager()
         self.cleaner = TitleCleaner(self.manager)
+
+    def _check_stop(self) -> None:
+        self.ctx.stop()
+
+    async def _goto(self, page, url: str, timeout_ms: int = 45000) -> None:
+        await goto_with_stop(page, url, stop=self._check_stop, timeout_ms=timeout_ms)
+
+    async def _wait(self, page, ms: int) -> None:
+        await wait_with_stop(page, ms, stop=self._check_stop)
 
     async def collect_via_api_capture(self, page, list_url: str, p1: int, p2: int) -> list[VideoItem]:
         """加密 SPA 列表采集: 挂钩 TextDecoder 拿解密后的 JSON, 点「下一页」翻页。
@@ -88,8 +125,8 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
             return []
         # 钩子必须在 goto 之前注入
         await page.add_init_script(self._API_HOOK_JS)
-        await page.goto(list_url, timeout=45000, wait_until="domcontentloaded")
-        await page.wait_for_timeout(4000)
+        await self._goto(page, list_url)
+        await self._wait(page, 4000)
         # 隐藏弹窗遮罩, 否则「下一页」点击会被拦截
         try:
             await page.evaluate(self._OVERLAY_HIDE_JS)
@@ -136,6 +173,7 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
         texts = b.next_page_texts or ["下一页", "加载更多", "更多"]
         max_clicks = max(1, p2 - p1 + 5)
         for _ in range(max_clicks):
+            self._check_stop()
             clicked = False
             for txt in texts:
                 try:
@@ -148,7 +186,7 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
                     continue
             if not clicked:
                 break
-            await page.wait_for_timeout(2500)
+            await self._wait(page, 2500)
             try:
                 await page.evaluate(self._OVERLAY_HIDE_JS)
             except Exception:
@@ -164,21 +202,29 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
         raise NotImplementedError("browser_list 需要 page 对象，请使用 parse_with_page")
 
     async def parse_with_page(self, page, url: str, page_no: int) -> ListPage:
+        await self._goto(page, url)
+        items = await self._extract_items(page, url, page_no)
+        if not items:
+            items = await self._collect_by_click(page, url, page_no)
+        return ListPage(page=page_no, items=items)
+
+    async def _extract_items(self, page, url: str, page_no: int) -> list[VideoItem]:
+        """从当前页面提取列表条目（不导航，供正常解析和点“下一页”复用）。"""
         b = self.manager.browser
         js = _CARD_JS % {
             "title_sels": json.dumps(",".join(b.title_selectors) or ".rank-title"),
             "card_sel": json.dumps(b.card_title_selector),
         }
-        await page.goto(url, timeout=45000, wait_until="domcontentloaded")
         els: list[dict] = []
         for _ in range(10):
+            self._check_stop()
             try:
                 els = await page.evaluate(js) or []
             except Exception:
                 els = []
             if els and any((x.get("t") or x.get("a") or x.get("ti")) for x in els):
                 break
-            await page.wait_for_timeout(1200)
+            await self._wait(page, 1200)
 
         out: list[VideoItem] = []
         seen: set[str] = set()
@@ -190,14 +236,113 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
             if play_hint and not play_hint.search(h):
                 continue
             seen.add(h)
-            t = (self.cleaner.clean(x.get("t") or "") or self.cleaner.clean(x.get("a") or "")
-                 or self.cleaner.clean(x.get("ti") or ""))
+            t = (
+                self.cleaner.clean(x.get("t") or "")
+                or self.cleaner.clean(x.get("a") or "")
+                or self.cleaner.clean(x.get("ti") or "")
+            )
             if self.cleaner.is_generic(t):
                 t = ""
             out.append(VideoItem(id=abs_url(h, url), title=t, page=page_no))
-        if not out:
-            out = await self._collect_by_click(page, url, page_no)
-        return ListPage(page=page_no, items=out)
+        return out
+
+    async def _click_next(self, page) -> bool:
+        """点「下一页/加载更多」；URL 不变、纯 JS 换内容的列表靠它翻页。"""
+        b = self.manager.browser
+        next_sel = b.next_page_selector or ".pg-btn, .load-more button"
+        texts = b.next_page_texts or ["下一页", "加载更多", "更多"]
+        before = page.url
+        for txt in texts:
+            try:
+                loc = page.locator(next_sel, has_text=txt)
+                if await loc.count() > 0:
+                    await loc.first.click(force=True)
+                    await self._after_click(page, before)
+                    return True
+            except (StopJob, JobAborted):
+                raise
+            except Exception:
+                continue
+        # DOM 结构不匹配规则时，按文字/aria-label 找可点击的翻页元素
+        try:
+            clicked = await page.evaluate(self._NEXT_JS)
+        except Exception:
+            clicked = False
+        if clicked:
+            await self._after_click(page, before)
+            return True
+        return False
+
+    async def _after_click(self, page, before_url: str) -> None:
+        """等一小会儿让新一页加载完；URL 变了就等 DOM 完成。"""
+        if page.url != before_url:
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+        await self._wait(page, 2000)
+
+    async def _extract_until_new(
+        self, page, url: str, page_no: int, seen: set[str], timeout_s: float = 8.0
+    ) -> list[VideoItem]:
+        """点完下一页后等新条目出现：SPA 换内容有延迟，不能拿到旧卡片就收手。"""
+        deadline = time.monotonic() + timeout_s
+        while True:
+            items = await self._extract_items(page, url, page_no)
+            if any(it.id not in seen for it in items):
+                return items
+            if time.monotonic() >= deadline:
+                return items
+            await self._wait(page, 500)
+
+    async def _scroll_more(self, page, url: str, page_no: int, seen: set[str]) -> bool:
+        """没有「下一页」按钮时尝试无限滚动/下拉加载：滚到底看是否出现新条目。"""
+        for _ in range(4):
+            try:
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            except Exception:
+                return False
+            await self._wait(page, 1200)
+            items = await self._extract_items(page, url, page_no)
+            if any(it.id not in seen for it in items):
+                return True
+        return False
+
+    async def collect_via_next_click(self, page, first_url: str, p1: int, p2: int) -> list[VideoItem]:
+        """URL 翻页无效时（page 参数被忽略/纯 JS 换内容）用浏览器点下一页采集。
+
+        ``first_url`` 必须是**第 1 页**的地址：点翻页只能从第 1 页开始逐页前进。
+        前 p1-1 页只点不收集，从 p1 页开始按逻辑页码标记 item.page，最多走到 p2。
+        某一页点完没有新条目就停止（说明已到末尾或按钮失效）。
+        """
+        await self._goto(page, first_url)
+        await self._wait(page, 1500)
+        out: list[VideoItem] = []
+        seen: set[str] = set()
+        page_no = 1
+        items = await self._extract_items(page, first_url, page_no)
+        while True:
+            fresh = [it for it in items if it.id not in seen]
+            if not fresh and page_no > 1:
+                break
+            for it in fresh:
+                seen.add(it.id)
+                if page_no >= p1:
+                    it.page = page_no
+                    out.append(it)
+            if page_no >= p2:
+                break
+            if await self._click_next(page):
+                page_no += 1
+                items = await self._extract_until_new(page, first_url, page_no, seen)
+                continue
+            # 没有翻页按钮：可能是无限滚动 / 下拉加载更多
+            if await self._scroll_more(page, first_url, page_no + 1, seen):
+                page_no += 1
+                items = await self._extract_items(page, first_url, page_no)
+                continue
+            break
+        return out
 
     async def _collect_by_click(self, page, url: str, page_no: int) -> list[VideoItem]:
         """SPA 列表兜底: 逐个点击卡片, 让前端路由跳到详情页, 再从地址栏取 URL。
@@ -209,8 +354,7 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
         cards_sel = ", ".join(b.card_selectors)
         if not cards_sel:
             return []
-        click_js = _CLICK_JS % {"cards": json.dumps(cards_sel),
-                                "card_sel": json.dumps(b.card_title_selector)}
+        click_js = _CLICK_JS % {"cards": json.dumps(cards_sel), "card_sel": json.dumps(b.card_title_selector)}
         try:
             await page.wait_for_selector(cards_sel, timeout=12000)
             n = await page.locator(cards_sel).count()
@@ -246,6 +390,7 @@ document.querySelectorAll('.van-overlay, .popup-wrapper, [class*=popup], .van-ta
             return True
 
         for i in range(min(n, max(1, b.card_click_max))):
+            self._check_stop()
             if i and not await back_to_list():
                 break
             try:

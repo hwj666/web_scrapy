@@ -1,4 +1,5 @@
 """全链路集成：本地列表页 → 播放页 → AES-128 HLS → ffmpeg，跑完整 Job.run()。"""
+
 from __future__ import annotations
 
 import functools
@@ -33,17 +34,35 @@ def _make_hls(root: str, key: bytes) -> None:
         f.write("key.bin\n")
         f.write(key_file + "\n")
     common = [
-        EXE, "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10",
-        "-t", "2", "-pix_fmt", "yuv420p",
-        "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
-        "-hls_key_info_file", key_info,
-        "-hls_segment_filename", os.path.join(root, "seg%03d.ts"),
+        EXE,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=10",
+        "-t",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_list_size",
+        "0",
+        "-hls_key_info_file",
+        key_info,
+        "-hls_segment_filename",
+        os.path.join(root, "seg%03d.ts"),
     ]
     playlist = os.path.join(root, "index.m3u8")
     for codec in (["-c:v", "libx264"], ["-c:v", "mpeg2video"]):
-        result = subprocess.run(common + codec + [playlist], capture_output=True,
-                                text=True, timeout=90, **no_window())
+        result = subprocess.run(
+            common + codec + [playlist], capture_output=True, text=True, timeout=90, **no_window()
+        )
         if result.returncode == 0:
             return
     raise unittest.SkipTest(f"ffmpeg 无法生成 HLS: {result.stderr[-400:]}")
@@ -69,12 +88,18 @@ class FullPipelineTests(unittest.TestCase):
                         "<html><head><title>测试视频一 - 影院</title></head><body>"
                         "<h1>测试视频一</h1><script>"
                         f'var url = "http://127.0.0.1:{port}/index.m3u8";'
-                        "</script></body></html>")
+                        "</script></body></html>"
+                    )
                 outdir = os.path.join(tmp, "out")
                 os.makedirs(outdir)
                 cfg = JobConfig(
                     list_url=f"http://127.0.0.1:{port}/list/{{}}.html",
-                    p1=1, p2=1, outdir=outdir, workers=1, seg_concurrency=4)
+                    p1=1,
+                    p2=1,
+                    outdir=outdir,
+                    workers=1,
+                    seg_concurrency=4,
+                )
                 job = Job(cfg)
                 job.rules.browser.use_api_capture = False
                 thread = threading.Thread(target=job.run, daemon=True)
@@ -90,8 +115,7 @@ class FullPipelineTests(unittest.TestCase):
                     self.assertEqual(job.st["stages"]["out"]["count"], 1)
                     mp4s = [n for n in os.listdir(outdir) if n.endswith(".mp4")]
                     self.assertEqual(len(mp4s), 1, os.listdir(outdir))
-                    self.assertEqual(
-                        [n for n in os.listdir(outdir) if n.endswith(".tmp")], [])
+                    self.assertEqual([n for n in os.listdir(outdir) if n.endswith(".tmp")], [])
                     self.assertGreater(os.path.getsize(os.path.join(outdir, mp4s[0])), 0)
                 finally:
                     job.dispose()

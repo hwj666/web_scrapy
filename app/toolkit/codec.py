@@ -1,10 +1,11 @@
 """编解码工具（纯标准库）。"""
+
 import re
 
 
 def unpad_pkcs7(b: bytes) -> bytes:
-    if b and 1 <= b[-1] <= 16 and b[-b[-1]:] == bytes([b[-1]]) * b[-1]:
-        return b[:-b[-1]]
+    if b and 1 <= b[-1] <= 16 and b[-b[-1] :] == bytes([b[-1]]) * b[-1]:
+        return b[: -b[-1]]
     return b
 
 
@@ -17,6 +18,7 @@ def decode_page(text: str) -> str:
     m = re.search(r'document\.write\(decodeURIComponent\("([^"]+)"\)\)', text or "", re.S)
     if m:
         from urllib.parse import unquote
+
         text = unquote(m.group(1))
     return re.sub(r"<script>.*?</script>", "", text, flags=re.S)
 

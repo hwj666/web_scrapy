@@ -1,7 +1,7 @@
 """Pydantic 模型：用类型约束替代裸字典，减少硬编码字符串键。"""
+
 from __future__ import annotations
 
-import os
 import re
 from enum import IntEnum
 from pathlib import Path
@@ -10,20 +10,22 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .settings import host, outdir, port
+
 # 仓库根目录（app/core/models.py → 往上两级是 app，再往上一级是仓库根）
 _ROOT = Path(__file__).resolve().parents[2]
-_DEFAULT_OUTDIR = os.environ.get("OUTDIR") or str(_ROOT / "downloads")
-_HOST = (os.environ.get("YS_HOST") or "0.0.0.0").strip() or "0.0.0.0"
-try:
-    _PORT = int(os.environ.get("YS_PORT") or 8765)
-except ValueError:
-    _PORT = 8765
-_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+_DEFAULT_OUTDIR = outdir()
+_HOST = host()
+_PORT = port()
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 
 class VideoState(IntEnum):
     """视频在流水线中的生命周期状态（快照里以 int 形式呈现给前端）。"""
+
     QUEUED = 0
     RUNNING = 1
     DONE = 2
@@ -33,6 +35,7 @@ class VideoState(IntEnum):
 
 class AppConfig(BaseModel):
     """全局应用配置。"""
+
     host: str = _HOST
     port: int = _PORT
     root: str = str(_ROOT)
@@ -42,6 +45,7 @@ class AppConfig(BaseModel):
 
 class JobConfig(BaseModel):
     """一次任务的完整配置。"""
+
     list_url: str
     candidates: list[str] = Field(default_factory=list)
     base: str = ""
@@ -51,6 +55,8 @@ class JobConfig(BaseModel):
     workers: int = 2
     # 分片下载总并发（所有视频加起来同时飞的分片数），界面可调，范围 1-24
     seg_concurrency: int = 8
+    # 只下载历史清单里没有的新视频（配合 cron 做增量追更）
+    only_new: bool = False
 
     @field_validator("list_url")
     @classmethod
@@ -77,8 +83,7 @@ class JobConfig(BaseModel):
     @model_validator(mode="after")
     def _fill_candidates_base(self) -> Self:
         if not self.candidates:
-            self.candidates = list(dict.fromkeys(
-                x for x in re.split(r"[,，;；\s]+", self.list_url) if x))
+            self.candidates = list(dict.fromkeys(x for x in re.split(r"[,，;；\s]+", self.list_url) if x))
         if not self.base and self.candidates:
             up = urlparse(self.candidates[0])
             self.base = f"{up.scheme}://{up.netloc}"
@@ -87,6 +92,7 @@ class JobConfig(BaseModel):
 
 class VideoItem(BaseModel):
     """列表页解析出的一个视频项。"""
+
     id: str
     title: str = ""
     duration: int = 0
@@ -102,27 +108,33 @@ class VideoItem(BaseModel):
 
 class ListPage(BaseModel):
     """一个列表页的解析结果。"""
+
     page: int
     items: list[VideoItem]
 
 
 class ResolvedVideo(BaseModel):
     """播放页解析结果。"""
+
     m3u8_url: str
     title: str = ""
 
 
 class DedupConfig(BaseModel):
     """VDF 查重配置。"""
+
     dir: str
     percent: float = Field(default=96.0, ge=50.0, le=100.0)
 
 
 class JobSnapshot(BaseModel):
     """给前端的状态快照（字段名与 index.html 约定保持一致）。"""
+
     running: bool = False
     stopped: bool = False
     error: str = ""
+    # 非致命警告（列表页抓取失败、跳过直播流、坏片校验未通过等），前端提示用
+    warnings: list[str] = Field(default_factory=list)
     percent: float = 0.0
     t0: float = 0.0
     t1: float | None = None

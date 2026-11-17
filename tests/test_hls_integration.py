@@ -2,6 +2,7 @@
 
 缺 ffmpeg/依赖时自动跳过；不访问外网（本地起一个只读 HTTP 服务）。
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -40,16 +41,34 @@ def _make_hls(root: str, key: bytes) -> str:
 
     playlist = os.path.join(root, "index.m3u8")
     common = [
-        EXE, "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10",
-        "-t", "2", "-pix_fmt", "yuv420p",
-        "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
-        "-hls_key_info_file", key_info,
-        "-hls_segment_filename", os.path.join(root, "seg%03d.ts"),
+        EXE,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=10",
+        "-t",
+        "2",
+        "-pix_fmt",
+        "yuv420p",
+        "-f",
+        "hls",
+        "-hls_time",
+        "1",
+        "-hls_list_size",
+        "0",
+        "-hls_key_info_file",
+        key_info,
+        "-hls_segment_filename",
+        os.path.join(root, "seg%03d.ts"),
     ]
     for codec in (["-c:v", "libx264"], ["-c:v", "mpeg2video"]):
-        r = subprocess.run(common + codec + [playlist], capture_output=True,
-                           text=True, timeout=90, **no_window())
+        r = subprocess.run(
+            common + codec + [playlist], capture_output=True, text=True, timeout=90, **no_window()
+        )
         if r.returncode == 0:
             return playlist
     raise unittest.SkipTest(f"ffmpeg 无法生成 HLS: {r.stderr[-400:]}")
@@ -80,8 +99,7 @@ class EncryptedHlsTests(unittest.TestCase):
                 self.assertGreater(os.path.getsize(mp4), 0)
                 # 原子落盘：成功后不应留下 .mp4.tmp / .tmp.ts 中间文件
                 self.assertFalse(os.path.exists(mp4 + ".tmp"))
-                self.assertEqual(
-                    [n for n in os.listdir(outdir) if n.endswith(".tmp.ts")], [])
+                self.assertEqual([n for n in os.listdir(outdir) if n.endswith(".tmp.ts")], [])
                 # 加密没解对时 ffmpeg 合成通常会失败或产出 0 字节；成功即说明
                 # 「按媒体序列号派生 IV」与逐片解密链路是对的。
             finally:

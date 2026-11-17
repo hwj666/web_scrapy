@@ -1,4 +1,4 @@
-﻿"""通用工具函数（新版）：规则外置、可配置、便于单测。"""
+"""通用工具函数（新版）：规则外置、可配置、便于单测。"""
 
 from .codec import decode_body, unpad_pkcs7
 from .files import ffmpeg_exe, sanitize
