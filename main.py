@@ -66,8 +66,8 @@ def _build_job_config(body: dict, default_outdir: str, safe_dir: Callable[[str],
         p2 = int(body.get("p2") or 0)
     except (TypeError, ValueError):
         raise ValueError("页码必须是数字") from None
-    if not (1 <= p1 <= p2 <= 999):
-        raise ValueError("页码范围应为 1~999 且 起始页 ≤ 结束页")
+    if not (1 <= p1 <= p2 <= 10000):
+        raise ValueError("页码范围应为 1~10000 且 起始页 ≤ 结束页")
     outdir = str(body.get("outdir", "")).strip() or default_outdir
     if not os.path.isabs(outdir):
         raise ValueError("输出目录必须是绝对路径，例: /downloads")

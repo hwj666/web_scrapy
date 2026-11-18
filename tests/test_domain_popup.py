@@ -145,6 +145,33 @@ class DomainProbePopupTests(unittest.TestCase):
             self.assertEqual(got, "https://new.example.com/list/1-{}.html")
             self.assertTrue(popup._closed)
 
+    def test_working_list_ignores_new_domain_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            original = "https://bqv.xseebb955.com:8321/type/10_{}.htm"
+            main = _FakePage(
+                "https://bqv.xseebb955.com:8321/type/10_1.htm",
+                body="新域名 rhh.xiuseaa100.vip",
+            )
+            cfg = JobConfig(list_url=original, p1=1, p2=1, outdir=tmp)
+            list_html = (
+                b"<html><body><a href='/play/1.html'>video 1</a>"
+                b"<a href='/play/2.html'>video 2</a>"
+                b"<script>window.location.href='/index.htm'</script></body></html>"
+            )
+
+            async def get_raw(url: str):
+                return FetchedResponse(url=url, status=200, headers={}, content=list_html)
+
+            @asynccontextmanager
+            async def new_page():
+                yield main, []
+
+            probe = DomainProbe(
+                cfg, RuleManager(), get_raw=get_raw, new_page=new_page, log=lambda msg: None, ua="test"
+            )
+            got = asyncio.run(probe.resolve_base(original))
+            self.assertEqual(got, original)
+
 
 class DomainCandidateTests(unittest.TestCase):
     """发布页只写一行新地址（无关键词/无链接）时的域名候选提取。"""

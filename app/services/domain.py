@@ -599,6 +599,9 @@ class DomainProbe:
             self.log(f"提示: {probe} 返回 HTTP {r0.status}, 该链接可能不是列表页")
             return tpl
         head = decode_body(r0.content, r0.headers.get("Content-Type", ""))[:30000]
+        # 正常列表页可能只有少量静态链接，或由 JS 渲染后续条目；不能因公告/页面脚本就按整站迁移处理。
+        if self._has_any_play_link(r0.content) and not self._looks_like_publish(r0.content):
+            return tpl
         if not any(k in head for k in self.rules.pipeline.shell_hints) and not (
             self.rules.pipeline.redirect_hint_re and self.rules.pipeline.redirect_hint_re.search(head)
         ):
